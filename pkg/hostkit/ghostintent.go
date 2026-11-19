@@ -33,7 +33,7 @@ func NewGhostIntent(ghost *bridgev2.Ghost) (core.GhostIntent, error) {
 	if !ok || as == nil {
 		return nil, errors.New("ghost intent is not an appservice intent")
 	}
-	return &ghostIntent{api: ghost.Intent, raw: as.Matrix}, nil
+	return &ghostIntent{api: ghost.Intent, raw: as.Matrix()}, nil
 }
 
 func (g *ghostIntent) UserID() id.UserID { return g.api.GetMXID() }

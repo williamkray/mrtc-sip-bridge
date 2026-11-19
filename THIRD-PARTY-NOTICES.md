@@ -12,8 +12,8 @@ Their source is available at the URLs below.
 
 | Component | Version | License | Source |
 |---|---|---|---|
-| maunium.net/go/mautrix (bridgev2) | v0.32.0 | MPL-2.0 | https://github.com/mautrix/go |
-| go.mau.fi/util | v0.11.0 | MPL-2.0 | https://github.com/mautrix/go-util |
+| maunium.net/go/mautrix (bridgev2) | v0.33.0 | MPL-2.0 | https://github.com/mautrix/go |
+| go.mau.fi/util | v0.11.1 | MPL-2.0 | https://github.com/mautrix/go-util |
 | emiago/diago | v0.41.0 | MPL-2.0 | https://github.com/emiago/diago |
 | emiago/sipgo | v1.6.0 | BSD-2-Clause | https://github.com/emiago/sipgo |
 | livekit/server-sdk-go/v2 | v2.18.1 | Apache-2.0 | https://github.com/livekit/server-sdk-go |

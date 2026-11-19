@@ -34,7 +34,7 @@ free of host-specific imports.
 
 ## Conventions
 
-- Go, mautrix bridgev2 (same version line as `../mautrix-jabber`, currently v0.32.x). Copy that project's
+- Go, mautrix bridgev2 (same version line as `../mautrix-jabber`, currently v0.33.x). Copy that project's
   build approach (Docker, cgo) and its telemetry conventions (`../mautrix-jabber/pkg/telemetry`,
   described in its CLAUDE.md).
 - Build, vet and test with `-tags "nocrypto nolibopusfile"` (no libolm, rooms are unencrypted; hraban/opus

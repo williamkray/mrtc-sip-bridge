@@ -26,6 +26,9 @@ number's room, or `!sip call <number>`), and sends keypad tones with `!sip dtmf`
 - A Matrix homeserver with a working MatrixRTC setup (LiveKit SFU + lk-jwt-service), already able to
   do Element Call between two normal users. The bridge finds lk-jwt-service through
   `https://<homeserver.domain>/.well-known/matrix/client` (`org.matrix.msc4143.rtc_foci`), or through
+  `network.livekit_service_url`. The bridge does not read the newer `/_matrix/client/v1/rtc/transports`
+  endpoint (Synapse 1.165+ `matrix_rtc.transports`, transport types `m.livekit`/`livekit`): if your
+  homeserver advertises LiveKit only there and no longer in `.well-known`, set
   `network.livekit_service_url`. lk-jwt-service must accept the bridge ghosts: its
   `LIVEKIT_FULL_ACCESS_HOMESERVERS` has to include your homeserver (or `*`).
 - Double puppeting configured for the bridge (read receipts as you stop the ring on push-driven clients).
