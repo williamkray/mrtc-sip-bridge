@@ -38,6 +38,7 @@ const (
 	queueSize     = 256
 	sweepEvery    = 10 * time.Minute
 	ensureTimeout = 10 * time.Second
+	sweepParallel = 4 // rooms a sweep ensures concurrently (bounded so the homeserver is not flooded)
 	widgetName    = "Dialpad"
 	urlTemplate   = "?widgetId=$matrix_widget_id&theme=$org.matrix.msc2873.client_theme"
 )
@@ -311,28 +312,42 @@ func (in *Installer) sweep(ctx context.Context, trigger string, from trace.SpanC
 	}
 	sctx, span := in.startSweepSpan(ctx, trigger, from)
 	defer span.End()
-	var st sweepStats
+	var (
+		st    sweepStats
+		stMu  sync.Mutex
+		wg    sync.WaitGroup
+		slots = make(chan struct{}, sweepParallel)
+		gctx  = obs.CarrySpan(ctx, sctx) // the room goroutines get the span context, not the live span
+	)
 	for _, r := range todo {
 		if ctx.Err() != nil {
 			break
 		}
-		st.checked++
-		rctx, cancel := context.WithTimeout(sctx, ensureTimeout)
-		res, err := in.ensure(rctx, r.RoomID, r.Title)
-		cancel()
-		switch {
-		case err != nil:
-			st.failed++
-			if !errors.Is(err, mautrix.MForbidden) && !errors.Is(err, ErrNotPrivateRoom) {
-				obs.Logger(sctx, &in.log).Debug().Stringer("room_id", r.RoomID).Str("error", obs.Scrub(err.Error())).
-					Msg("Widget sweep: room failed")
+		slots <- struct{}{}
+		wg.Add(1)
+		go func(r RoomRef) {
+			defer func() { <-slots; wg.Done() }()
+			rctx, cancel := context.WithTimeout(gctx, ensureTimeout)
+			res, err := in.ensure(rctx, r.RoomID, r.Title)
+			cancel()
+			stMu.Lock()
+			defer stMu.Unlock()
+			st.checked++
+			switch {
+			case err != nil:
+				st.failed++
+				if !errors.Is(err, mautrix.MForbidden) && !errors.Is(err, ErrNotPrivateRoom) {
+					obs.Logger(gctx, &in.log).Debug().Stringer("room_id", r.RoomID).Str("error", obs.Scrub(err.Error())).
+						Msg("Widget sweep: room failed")
+				}
+			case res == outcomeInstalled:
+				st.installed++
+			case res == outcomeUpdated:
+				st.updated++
 			}
-		case res == outcomeInstalled:
-			st.installed++
-		case res == outcomeUpdated:
-			st.updated++
-		}
+		}(r)
 	}
+	wg.Wait()
 	in.endSweep(sctx, span, trigger, st)
 }
 
