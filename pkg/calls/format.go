@@ -336,7 +336,7 @@ func (c *call) choosePlan(ctx context.Context) {
 	c.setupSpan.SetAttributes(obs.AttrMatrixRTCPlanFormat.String(c.plan.formatName()),
 		obs.AttrMatrixRTCPlanReason.String(c.plan.reason))
 	c.logFor(ctx).Info().Str("format", c.plan.formatName()).Str("reason", c.plan.reason).
-		Str("token_endpoint", tokenEndpointName(c.plan.auth)).Bool("delayed_leave", c.plan.sticky && c.plan.delayed).
+		Str("livekit_auth", tokenEndpointName(c.plan.auth)).Bool("delayed_leave", c.plan.sticky && c.plan.delayed).
 		Msg("MatrixRTC membership plan")
 }
 

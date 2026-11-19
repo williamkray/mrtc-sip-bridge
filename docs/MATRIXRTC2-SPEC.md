@@ -586,4 +586,15 @@ Deviations from the plan above (code wins):
   pauses sticky for the login for 10 min (`stickyUnsupportedTTL`). The capability cache keeps errors for 30 s.
 
 ## 9. WP0 results
-(to fill in)
+Verified live 2026-11-19 on the jmpchat deployment (v0.15.0 / mrtc-sip-bridge v0.4.0, Synapse with
+msc4354/4140/4143, lk-jwt-service in appservice mode), from Datadog traces, logs and metrics:
+1. MSC4195 `get_token` as the ghost via masquerade works: `POST /_matrix/client/v1/rtc/livekit/get_token` 200
+   (stable path), no fallback; the ghost joined the owner's LiveKit room.
+2. Delayed sticky events work for ghosts: `matrixrtc.delayed_leave=true` on publish, teardown via
+   `leave_via=delayed_send`, `mrtcsip.matrixrtc.delayed_leave.restarts` outcome `ok` only.
+3. Owner `m.rtc.member` reached the AS as `matrixrtc.kind=rtc_member` (sticky) with slot `m.call#room`.
+4. sable-next's slot is not encrypted: `matrixrtc.slot.action=noop` for the owner's `m.call#room`.
+5. Calls: two owner-initiated sticky (`owner_sticky_mirror`), one owner-initiated legacy (`owner_legacy`,
+   OpenID `/sfu/get`, same LiveKit room hash: lk-jwt ≥ 0.10 maps the slot), one inbound
+   (`dual`, `bridge_dialect`, owner answered). All answered, no error spans, no call warnings.
+6. Client: sable-next v26.11.4 (stable names).
