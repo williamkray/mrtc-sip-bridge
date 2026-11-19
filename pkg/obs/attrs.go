@@ -74,6 +74,25 @@ const (
 	AttrDTMFDigitCount = attribute.Key("dtmf.digit_count") // cmd.dtmf: number of digits (never the digits)
 	AttrDTMFMethod     = attribute.Key("dtmf.method")      // metric: rfc4733
 
+	// MatrixRTC 2.0 (docs/MATRIXRTC2-SPEC.md WP6). Closed enums; slot ids are a fixed small set.
+	AttrMatrixRTCFormat       = attribute.Key("matrixrtc.membership.format") // legacy, sticky
+	AttrMatrixRTCSlotID       = attribute.Key("matrixrtc.slot_id")
+	AttrMatrixRTCSlotAction   = attribute.Key("matrixrtc.slot.action")       // noop, opened, refused_encrypted
+	AttrMatrixRTCMemberType   = attribute.Key("matrixrtc.member.event_type") // event type name sent
+	AttrMatrixRTCDelayedLeave = attribute.Key("matrixrtc.delayed_leave")     // bool: a delayed leave was scheduled
+	AttrMatrixRTCLeaveVia     = attribute.Key("matrixrtc.member.leave_via")  // delayed_send, explicit
+	AttrRTCTokenEndpoint      = attribute.Key("rtc.token.endpoint")          // sfu_get, get_token_cs
+
+	// MatrixRTC 2.0 planning and fallbacks (pkg/calls format.go, rtcmember.go): which dialect was chosen,
+	// why, and which fallback was taken. Closed enums except the booleans.
+	AttrMatrixRTCPlanFormat       = attribute.Key("matrixrtc.plan.format")       // legacy, sticky, dual
+	AttrMatrixRTCPlanReason       = attribute.Key("matrixrtc.plan.reason")       // see calls/format.go reason* constants
+	AttrMatrixRTCPlanDowngrade    = attribute.Key("matrixrtc.plan.downgrade")    // slot_error, sticky_unsupported, sticky_error
+	AttrMatrixRTCStickySupported  = attribute.Key("matrixrtc.sticky.supported")  // bool
+	AttrMatrixRTCDelayedSupported = attribute.Key("matrixrtc.delayed.supported") // bool
+	AttrMatrixRTCTransports       = attribute.Key("matrixrtc.transports.status") // not_needed, ok, no_livekit_url, error
+	AttrRTCTokenFallback          = attribute.Key("rtc.token.fallback")          // bool: MSC4195 get_token failed, sfu_get used
+
 	// Closed-enum attributes used only on metrics.
 	AttrOutcome = attribute.Key("outcome")
 	AttrState   = attribute.Key("state")

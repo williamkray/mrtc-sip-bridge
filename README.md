@@ -26,10 +26,11 @@ number's room, or `!sip call <number>`), and sends keypad tones with `!sip dtmf`
 - A Matrix homeserver with a working MatrixRTC setup (LiveKit SFU + lk-jwt-service), already able to
   do Element Call between two normal users. The bridge finds lk-jwt-service through
   `https://<homeserver.domain>/.well-known/matrix/client` (`org.matrix.msc4143.rtc_foci`), or through
-  `network.livekit_service_url`. The bridge does not read the newer `/_matrix/client/v1/rtc/transports`
-  endpoint (Synapse 1.165+ `matrix_rtc.transports`, transport types `m.livekit`/`livekit`): if your
-  homeserver advertises LiveKit only there and no longer in `.well-known`, set
-  `network.livekit_service_url`. lk-jwt-service must accept the bridge ghosts: its
+  `network.livekit_service_url`. The lk-jwt-service URL is never taken from the newer
+  `/_matrix/client/v1/rtc/transports` endpoint (Synapse 1.165+ `matrix_rtc.transports`, transport types
+  `m.livekit`/`livekit`): if your homeserver advertises LiveKit only there and no longer in `.well-known`,
+  set `network.livekit_service_url`. (The bridge does read `/rtc/transports` for the SFU address of
+  sticky memberships, see "MatrixRTC 2.0" below.) lk-jwt-service must accept the bridge ghosts: its
   `LIVEKIT_FULL_ACCESS_HOMESERVERS` has to include your homeserver (or `*`).
 - Double puppeting configured for the bridge (read receipts as you stop the ring on push-driven clients).
 - A SIP account (registrar, username, password) and a reachable UDP port range for RTP.
@@ -83,6 +84,8 @@ The `network:` section:
 | `ring_timeout_seconds` | 30 | Ring time before a call counts as missed (5-300). Element Web stops ringing after 120 s regardless. |
 | `rtp_timeout_seconds` | 60 | Hang up an answered call when no audio (RTP) arrives from the provider for this long (10-3600). |
 | `livekit_service_url` | `""` | lk-jwt-service URL, e.g. `https://matrix-rtc.example.org/livekit/jwt`. Empty = discover from the homeserver's `.well-known` (`org.matrix.msc4143.rtc_foci`). |
+| `matrixrtc_format` | `auto` | Membership format of the bridge's phone-number user: `auto` (follow your client, see "MatrixRTC 2.0"), `legacy` (only the `call.member` state event, the behaviour before 2.0), `sticky` (only the sticky `m.rtc.member`), `dual` (both). |
+| `livekit_auth` | `auto` | How the bridge gets its LiveKit token: `auto` (homeserver `get_token` per MSC4195, falling back to lk-jwt-service `/sfu/get`), `sfu_get` (always `/sfu/get`, the behaviour before 2.0), `msc4195` (only `get_token`). |
 | `default_country_code` | `"1"` | Country code assumed for numbers without a leading `+`. |
 | `outbound_trigger` | `ring` | How the bridge notices that you started a call in a number's room: `ring` (your client's call notification plus your fresh call membership), `membership` (fresh membership alone, for clients that send no notification), `off` (only `!sip call`). |
 | `dial_timeout_seconds` | 60 | Cancel an outgoing call that is not answered within this time (10-300). |
@@ -92,6 +95,37 @@ The `network:` section:
 | `dtmf_redact_command` | `true` | Redact `dtmf` command messages after sending the tones (they may contain PINs). |
 
 `stun_server: ""` plus an explicit `external_ip` keeps the bridge from contacting Google.
+
+### MatrixRTC 2.0 (sticky memberships)
+
+Newer clients publish their call membership as a sticky `m.rtc.member` event in a room call slot
+(MSC4143, MSC4354) instead of a per-device `call.member` state event. The bridge reads both formats, in
+both type-name and slot-id spellings. What it publishes for its phone-number user is `matrixrtc_format`:
+
+- A call you start from a client that uses sticky memberships is answered with a sticky membership in the
+  same dialect (type name, slot id, SFU address). A client that still uses `call.member` gets `call.member`.
+- Calls the bridge starts (incoming SIP calls, `call`, the Dialpad widget) publish both formats, so every
+  client sees the call. The bridge opens the room's `m.call` slot if it is not open and never closes it. A
+  slot that declares encryption makes the bridge refuse the call, like an encrypted room.
+- The sticky membership carries a delayed leave (MSC4140, 20 s, restarted every 7 s), so a crashed bridge
+  does not leave a ghost in the call for up to an hour. Long calls refresh the membership every 40 min.
+- With no sticky support on the homeserver (or `matrixrtc_format: legacy`) nothing changes.
+
+Synapse prerequisites for the sticky format (`homeserver.yaml`, names as of Synapse 1.165):
+
+```yaml
+experimental_features:
+  msc4354_enabled: true   # sticky events
+  msc4140_enabled: true   # delayed events
+  msc4143_enabled: true   # /rtc/transports
+max_event_delay_duration: 30s   # at least 30 s
+```
+
+For the homeserver token (`livekit_auth: auto` or `msc4195`) lk-jwt-service 0.10 or newer has to run in
+appservice-proxy mode with Synapse forwarding `get_token` to it (`msc4502_enabled` and `msc4512_enabled`; see
+the lk-jwt-service README). The request's `url` must equal the service's `LIVEKIT_URL` byte for byte. If the
+token request fails, the bridge uses `/sfu/get` for that call and re-publishes its membership accordingly.
+Tracing shows which path each call took (`matrixrtc.plan.choose`, `rtc.token.fallback`).
 
 ## Dialpad widget
 
@@ -456,9 +490,14 @@ Phase 1, 2 and 3 coverage:
   span (kind, attempt, registrar address, status code, outcome, next
   retry delay, masked user). **Successful refreshes (every 25 s by default) create no span**; they are
   visible only as metrics.
-- **MatrixRTC event ingest:** a `matrixrtc.ingest` span for each call.member / notification / decline
-  event that is routed to a login. Dropped events (ghost echoes, the bot, unknown rooms) create no span but
+- **MatrixRTC event ingest:** a `matrixrtc.ingest` span for each call.member / rtc.member / rtc.slot /
+  notification / decline event that is routed to a login. Dropped events (ghost echoes, the bot, unknown rooms) create no span but
   are counted in `mrtcsip.matrixrtc.events{routed=false}`.
+- **MatrixRTC 2.0:** under the call's setup and teardown spans, child spans `matrixrtc.plan.choose` (which
+  format and token endpoint, and why), `matrixrtc.slot.open`, `matrixrtc.member.publish`,
+  `matrixrtc.member.leave` and `matrixrtc.ring.withdraw`. The delayed-leave restarts (every 7 s per call)
+  create no spans, only the metric below. Attributes are closed enums (`matrixrtc.plan.format`,
+  `matrixrtc.plan.reason`, `matrixrtc.slot.action`, `rtc.token.endpoint`, ...), see `docs/TELEMETRY-SPEC.md`.
 - **Identity resolution:** a `bridge.resolve_identifier` span for phone-number lookups such as
   start-chat, with the local and remote E.164 numbers.
 - **Bot commands:** `cmd.<name>` spans (the command name only, never its arguments).
@@ -537,6 +576,7 @@ room ids, call ids, SIP usernames or IP addresses. Go runtime metrics are also e
 | `mrtcsip.call.ring.duration` | histogram, `s` | `call.direction`, `call.outcome` | Ring sent until it ended. |
 | `mrtcsip.call.duration` | histogram, `s` | `call.direction`, `media.codec` | Answered call length. |
 | `mrtcsip.rtc.join.duration` | histogram, `s` | `outcome` | One LiveKit join attempt. |
+| `mrtcsip.matrixrtc.delayed_leave.restarts` | counter | `outcome` (ok, gone, error) | Restarts of the delayed leave of a sticky membership. |
 | `mrtcsip.media.rtp.packets` | counter | `media.direction` (`rx`, `tx`) | SIP-side RTP packets. |
 | `mrtcsip.media.rtp.lost`, `mrtcsip.media.rtp.late` | counter | none | Lost and late-dropped inbound RTP packets. |
 | `mrtcsip.media.rtp.jitter` | histogram, `s` | none | Inbound RTP jitter, sampled every 5 s. |

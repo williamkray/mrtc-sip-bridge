@@ -20,7 +20,7 @@ func defaultConfig() Config {
 		SIPPortMin: 5060, SIPPortMax: 5069, STUNServer: defaultSTUNServer,
 		RTPPortMin: 40000, RTPPortMax: 40100,
 		RegisterExpirySeconds: 60, RegisterRefreshSeconds: 25, RingTimeoutSeconds: 30, RTPTimeoutSeconds: 60,
-		DefaultCountryCode: "1",
+		DefaultCountryCode: "1", MatrixRTCFormat: "auto", LiveKitAuth: "auto",
 		Widget: WidgetConfig{Secret: "generate", FrameAncestors: []string{"*"}, TrustedProxies: []string{},
 			PWA: PWAConfig{InactivityDays: 90, RotationGraceSeconds: 120, EnrollMinutes: 15, MaxLinksPerUser: 5, NotifyOnEnroll: &notify}},
 	}
@@ -98,6 +98,9 @@ var validateCases = []validateCase{
 	{"prefix alpha", func(c *Config) { c.DialAllowedPrefixes = []string{"+1", "+4x"} }, "dial_allowed_prefixes"},
 	{"format bad", func(c *Config) { c.DialNumberFormat = "national" }, "dial_number_format"},
 	{"cc alpha", func(c *Config) { c.DefaultCountryCode = "4a" }, "default_country_code"},
+	{"rtc format bad", func(c *Config) { c.MatrixRTCFormat = "both" }, "matrixrtc_format"},
+	{"rtc format empty", func(c *Config) { c.MatrixRTCFormat = "" }, "matrixrtc_format"},
+	{"livekit auth bad", func(c *Config) { c.LiveKitAuth = "openid" }, "livekit_auth"},
 }
 
 func TestValidate(t *testing.T) {
@@ -125,6 +128,9 @@ func TestValidate(t *testing.T) {
 		func(c *Config) { c.DialAllowedPrefixes = []string{"+1", "+44"} },
 		func(c *Config) { c.DialNumberFormat = "e164" },
 		func(c *Config) { c.LiveKitServiceURL = "https://lk.example.com/jwt" },
+		func(c *Config) { c.MatrixRTCFormat, c.LiveKitAuth = "legacy", "sfu_get" },
+		func(c *Config) { c.MatrixRTCFormat, c.LiveKitAuth = "sticky", "msc4195" },
+		func(c *Config) { c.MatrixRTCFormat = "dual" },
 	} {
 		c := defaultConfig()
 		ok(&c)
@@ -136,7 +142,8 @@ func TestValidate(t *testing.T) {
 
 func TestUpgradePreservesUserValues(t *testing.T) {
 	userYAML := "external_ip: 203.0.113.9\nrtp_port_min: 41000\nrtp_timeout_seconds: 90\ndefault_country_code: \"44\"\n" +
-		"outbound_trigger: membership\ndial_timeout_seconds: 90\ndial_allowed_prefixes: []\ndial_number_format: e164\nallow_self_dial: true\ndtmf_redact_command: false\n"
+		"outbound_trigger: membership\ndial_timeout_seconds: 90\ndial_allowed_prefixes: []\ndial_number_format: e164\nallow_self_dial: true\ndtmf_redact_command: false\n" +
+		"matrixrtc_format: sticky\nlivekit_auth: msc4195\n"
 	out, err := configupgrade.DoBytes([]byte(userYAML), &configupgrade.StructUpgrader{
 		SimpleUpgrader: configupgrade.SimpleUpgrader(func(h configupgrade.Helper) { CopyKeys(h) }),
 		Base:           ExampleYAML,
@@ -149,6 +156,7 @@ func TestUpgradePreservesUserValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := defaultConfig()
+	want.MatrixRTCFormat, want.LiveKitAuth = "sticky", "msc4195"
 	want.ExternalIP = "203.0.113.9"
 	want.RTPPortMin = 41000
 	want.RTPTimeoutSeconds = 90

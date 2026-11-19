@@ -19,6 +19,8 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/williamkray/mrtc-sip-bridge/pkg/clock"
+	"github.com/williamkray/mrtc-sip-bridge/pkg/core"
+	"github.com/williamkray/mrtc-sip-bridge/pkg/matrixrtc"
 	"github.com/williamkray/mrtc-sip-bridge/pkg/media"
 	"github.com/williamkray/mrtc-sip-bridge/pkg/obs"
 )
@@ -29,13 +31,19 @@ const (
 	readBufSize    = 1500
 )
 
+// tokenTimeout bounds the whole MSC4195 get_token call (stable path, then unstable) so a stalled
+// homeserver or auth service cannot eat the join budget (the actor's join timer is 10 s) and the
+// sfu_get fallback still has time to run. A variable so tests can shorten it.
+var tokenTimeout = 4 * time.Second
+
 // roomConn is the seam over *lksdk.Room used by Join (faked in tests).
 type roomConn interface {
 	Name() string
 	LocalIdentity() string
 	Publish(track *lksdk.LocalTrack) error
 	// ScanRemote calls fn for every remote participant already present; for those where fn returns true
-	// (owner) the audio publications are subscribed (never inline in an SDK callback).
+	// (owner) the audio publications are subscribed (never inline in an SDK callback). May be called
+	// repeatedly; subscribing is idempotent.
 	ScanRemote(fn func(identity string) bool)
 	// HasParticipant reports whether a remote participant with this identity is currently in the room.
 	HasParticipant(identity string) bool
@@ -120,6 +128,7 @@ func (j *joiner) Join(ctx context.Context, p JoinParams) (sess Session, err erro
 	if p.Attempt > 0 {
 		span.SetAttributes(obs.AttrRTCJoinAttempt.Int(p.Attempt))
 	}
+	dialStarted := false
 	defer func() {
 		outcome := "ok"
 		if err != nil {
@@ -127,6 +136,7 @@ func (j *joiner) Join(ctx context.Context, p JoinParams) (sess Session, err erro
 			var je *JoinError
 			if errors.As(err, &je) {
 				outcome = je.Stage
+				je.BeforeConnect = !dialStarted
 			}
 			obs.Fail(span, err)
 		}
@@ -144,40 +154,65 @@ func (j *joiner) Join(ctx context.Context, p JoinParams) (sess Session, err erro
 		return fail(stage, err)
 	}
 
-	// 1. OpenID token as the ghost. Never logged or recorded.
-	_, s1 := obs.StartChild(ctx, "rtc.openid_token", trace.WithSpanKind(trace.SpanKindClient))
-	tok, err := p.Ghost.RequestOpenIDToken(ctx)
-	if err != nil {
-		obs.Fail(s1, err)
-		s1.End()
-		return nil, timeoutOr("openid_error", err)
-	}
-	s1.End()
-	if err := ctx.Err(); err != nil {
-		return nil, fail("timeout", err)
-	}
-
-	// 2. lk-jwt-service.
-	svcHost := ""
-	if u, perr := url.Parse(p.ServiceURL); perr == nil {
-		svcHost = u.Host
-	}
-	jctx, s2 := obs.StartChild(ctx, "rtc.jwt_fetch", trace.WithSpanKind(trace.SpanKindClient),
-		trace.WithAttributes(obs.AttrServerAddress.String(svcHost)))
-	lkURL, jwt, err := fetchToken(jctx, j.hc, p.ServiceURL, p.RoomID, p.DeviceID, tok)
-	var se *tokenStatusError
-	switch {
-	case err == nil:
-		s2.SetAttributes(obs.AttrHTTPResponseStatus.Int(200))
-	case errors.As(err, &se):
-		s2.SetAttributes(obs.AttrHTTPResponseStatus.Int(se.Status))
-	}
-	if err != nil {
-		obs.Fail(s2, err)
+	var lkURL, jwt string
+	if p.Auth == AuthMSC4195 {
+		// 1+2. Homeserver get_token as the ghost (MSC4195); no OpenID step.
+		gr, ok := p.Ghost.(core.GhostRTCIntent)
+		if !ok {
+			return nil, fail("token_error", errors.New("ghost does not support MSC4195 get_token"))
+		}
+		if p.LiveKitURL == "" {
+			return nil, fail("token_error", errors.New("no LiveKit url for MSC4195 get_token"))
+		}
+		lkURL = p.LiveKitURL
+		jctx, s2 := obs.StartChild(ctx, "rtc.jwt_fetch", trace.WithSpanKind(trace.SpanKindClient),
+			trace.WithAttributes(obs.AttrServerAddress.String(hostOf(lkURL)), obs.AttrRTCTokenEndpoint.String("get_token_cs")))
+		var terr error
+		tctx, tcancel := context.WithTimeout(jctx, tokenTimeout)
+		jwt, terr = gr.LiveKitToken(tctx, core.LiveKitTokenRequest{URL: p.LiveKitURL, RoomID: p.RoomID, SlotID: p.SlotID, MemberID: p.MemberID})
+		tcancel()
+		if terr == nil && jwt == "" {
+			terr = errors.New("get_token returned no jwt")
+		}
+		if terr != nil {
+			obs.Fail(s2, terr)
+			s2.End()
+			return nil, timeoutOr("token_error", terr)
+		}
 		s2.End()
-		return nil, timeoutOr("token_error", err)
+	} else {
+		// 1. OpenID token as the ghost. Never logged or recorded.
+		_, s1 := obs.StartChild(ctx, "rtc.openid_token", trace.WithSpanKind(trace.SpanKindClient))
+		tok, err := p.Ghost.RequestOpenIDToken(ctx)
+		if err != nil {
+			obs.Fail(s1, err)
+			s1.End()
+			return nil, timeoutOr("openid_error", err)
+		}
+		s1.End()
+		if err := ctx.Err(); err != nil {
+			return nil, fail("timeout", err)
+		}
+
+		// 2. lk-jwt-service.
+		jctx, s2 := obs.StartChild(ctx, "rtc.jwt_fetch", trace.WithSpanKind(trace.SpanKindClient),
+			trace.WithAttributes(obs.AttrServerAddress.String(hostOf(p.ServiceURL)), obs.AttrRTCTokenEndpoint.String("sfu_get")))
+		var ferr error
+		lkURL, jwt, ferr = fetchToken(jctx, j.hc, p.ServiceURL, p.RoomID, p.DeviceID, tok)
+		var se *tokenStatusError
+		switch {
+		case ferr == nil:
+			s2.SetAttributes(obs.AttrHTTPResponseStatus.Int(200))
+		case errors.As(ferr, &se):
+			s2.SetAttributes(obs.AttrHTTPResponseStatus.Int(se.Status))
+		}
+		if ferr != nil {
+			obs.Fail(s2, ferr)
+			s2.End()
+			return nil, timeoutOr("token_error", ferr)
+		}
+		s2.End()
 	}
-	s2.End()
 	if err := ctx.Err(); err != nil {
 		return nil, fail("timeout", err)
 	}
@@ -193,13 +228,11 @@ func (j *joiner) Join(ctx context.Context, p JoinParams) (sess Session, err erro
 	s.leg = &rtcLeg{s: s, write: func(frame []byte, d time.Duration) error {
 		return track.WriteSample(pionmedia.Sample{Data: frame, Duration: d}, nil)
 	}}
-	lkHost := ""
-	if u, perr := url.Parse(lkURL); perr == nil {
-		lkHost = u.Host
-	}
+	lkHost := hostOf(lkURL)
 	s.server = lkHost
 	_, s3 := obs.StartChild(ctx, "rtc.livekit.connect", trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(obs.AttrLiveKitServer.String(lkHost)))
+	dialStarted = true
 	room, err := j.dial(lkURL, jwt, s.callbacks(), j.connectTimeout)
 	if err != nil {
 		obs.Fail(s3, err)
@@ -217,7 +250,11 @@ func (j *joiner) Join(ctx context.Context, p JoinParams) (sess Session, err erro
 	s.roomName = room.Name()
 	s3.SetAttributes(obs.AttrLiveKitRoom.String(s.roomName), obs.AttrLiveKitIdentity.String(s.identity))
 	s3.End()
-	if want := string(p.Ghost.UserID()) + ":" + p.DeviceID; s.identity != want {
+	want := matrixrtc.LegacyLiveKitIdentity(p.Ghost.UserID(), p.DeviceID)
+	if p.Auth == AuthMSC4195 {
+		want = matrixrtc.LiveKitIdentity(p.Ghost.UserID(), p.MemberID)
+	}
+	if s.identity != want {
 		log.Warn().Str("identity", s.identity).Str("want", want).
 			Msg("LiveKit identity differs from membership-derived identity: owner clients will not render this participant")
 	}
@@ -237,14 +274,58 @@ func (j *joiner) Join(ctx context.Context, p JoinParams) (sess Session, err erro
 	s4.End()
 
 	// 5. Participants already present.
-	room.ScanRemote(func(identity string) bool {
-		if !isOwner(identity, p.Owner) {
+	s.rescan()
+	return s, nil
+}
+
+func hostOf(raw string) string {
+	if u, err := url.Parse(raw); err == nil {
+		return u.Host
+	}
+	return ""
+}
+
+// AddOwnerIdentities implements Session.
+func (s *session) AddOwnerIdentities(ids ...string) {
+	s.owners.add(ids...)
+	if s.leaving.Load() {
+		return
+	}
+	s.rescan()
+}
+
+// rescan emits EventOwnerJoined for owner participants already present that were not announced yet and
+// has the room subscribe their audio. Non-owners are never subscribed. Called from Join and from
+// AddOwnerIdentities (caller goroutines, never an SDK callback).
+func (s *session) rescan() {
+	h := s.roomPtr.Load()
+	if h == nil {
+		return
+	}
+	h.r.ScanRemote(func(identity string) bool {
+		if !s.owners.match(identity) || !s.markAnnounced(identity) {
 			return false
 		}
 		s.emit(Event{Kind: EventOwnerJoined, Identity: identity})
 		return true
 	})
-	return s, nil
+}
+
+// markAnnounced records that OwnerJoined was (or is being) emitted for identity; false if it already was.
+func (s *session) markAnnounced(identity string) bool {
+	s.annMu.Lock()
+	defer s.annMu.Unlock()
+	if _, ok := s.announced[identity]; ok {
+		return false
+	}
+	s.announced[identity] = struct{}{}
+	return true
+}
+
+func (s *session) clearAnnounced(identity string) {
+	s.annMu.Lock()
+	delete(s.announced, identity)
+	s.annMu.Unlock()
 }
 
 // ownerTrack is one subscribed owner audio track.
@@ -285,6 +366,10 @@ type session struct {
 
 	receiver atomic.Pointer[receiverBox]
 
+	owners    *ownerMatcher
+	annMu     sync.Mutex
+	announced map[string]struct{} // owner identities OwnerJoined was emitted for
+
 	trMu    sync.Mutex
 	tracks  []*ownerTrack
 	current atomic.Pointer[ownerTrack]
@@ -295,7 +380,8 @@ type roomHolder struct{ r roomConn }
 type receiverBox struct{ r media.PacketReceiver }
 
 func newSession(p JoinParams, log zerolog.Logger, clk clock.Clock) *session {
-	return &session{p: p, log: log, clk: clk, events: make(chan Event, eventBuffer), left: make(chan struct{})}
+	return &session{p: p, log: log, clk: clk, events: make(chan Event, eventBuffer), left: make(chan struct{}),
+		owners: newOwnerMatcher(p.Owner, p.Owners), announced: map[string]struct{}{}}
 }
 
 func (s *session) Identity() string      { return s.identity }
@@ -373,21 +459,19 @@ func (s *session) callbacks() *lksdk.RoomCallback {
 			}
 		},
 		OnParticipantConnected: func(rp *lksdk.RemoteParticipant) {
-			if isOwner(rp.Identity(), s.p.Owner) {
-				s.emit(Event{Kind: EventOwnerJoined, Identity: rp.Identity()})
-			}
+			s.onParticipantConnected(rp.Identity())
 		},
 		OnParticipantDisconnected: func(rp *lksdk.RemoteParticipant) {
 			s.onParticipantDisconnected(rp.Identity())
 		},
 		ParticipantCallback: lksdk.ParticipantCallback{
 			OnTrackPublished: func(pub *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
-				if pub.Kind() == lksdk.TrackKindAudio && isOwner(rp.Identity(), s.p.Owner) {
+				if pub.Kind() == lksdk.TrackKindAudio && s.owners.match(rp.Identity()) {
 					go func() { _ = pub.SetSubscribed(true) }()
 				}
 			},
 			OnTrackSubscribed: func(t *webrtc.TrackRemote, pub *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
-				if t.Kind() != webrtc.RTPCodecTypeAudio || !isOwner(rp.Identity(), s.p.Owner) {
+				if t.Kind() != webrtc.RTPCodecTypeAudio || !s.owners.match(rp.Identity()) {
 					return
 				}
 				s.addTrack(rp.Identity(), remoteReader{t})
@@ -396,9 +480,18 @@ func (s *session) callbacks() *lksdk.RoomCallback {
 	}
 }
 
+// onParticipantConnected handles a remote participant joining (SDK callback goroutine, no I/O). Only an
+// owner identity that was not announced yet produces EventOwnerJoined (rescan may have announced it
+// already); a departure clears the mark (onParticipantDisconnected), so a reconnect is announced again.
+func (s *session) onParticipantConnected(identity string) {
+	if s.owners.match(identity) && s.markAnnounced(identity) {
+		s.emit(Event{Kind: EventOwnerJoined, Identity: identity})
+	}
+}
+
 // onParticipantDisconnected handles a remote participant leaving (SDK callback goroutine).
 func (s *session) onParticipantDisconnected(identity string) {
-	if !isOwner(identity, s.p.Owner) {
+	if !s.owners.match(identity) {
 		return
 	}
 	s.removeIdentity(identity)
@@ -408,6 +501,7 @@ func (s *session) onParticipantDisconnected(identity string) {
 	if h := s.roomPtr.Load(); h != nil && h.r.HasParticipant(identity) {
 		return
 	}
+	s.clearAnnounced(identity)
 	s.emit(Event{Kind: EventOwnerLeft, Identity: identity})
 }
 

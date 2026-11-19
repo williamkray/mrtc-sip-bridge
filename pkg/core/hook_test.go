@@ -50,3 +50,28 @@ func TestRegisterMatrixRTCHandlers(t *testing.T) {
 		t.Fatalf("sink got %+v", sink.got)
 	}
 }
+
+func TestRegisterMatrixRTCHandlersTenTypesWithClasses(t *testing.T) {
+	reg := &fakeRegistrar{}
+	RegisterMatrixRTCHandlers(reg, func(context.Context, *event.Event) (LoginRef, bool) { return "", false }, NewIngest(nil))
+	if len(reg.types) != 10 {
+		t.Fatalf("registered %d types, want 10", len(reg.types))
+	}
+	wantClass := map[string]event.TypeClass{
+		"org.matrix.msc3401.call.member": event.StateEventType, "m.call.member": event.StateEventType,
+		"org.matrix.msc4143.rtc.slot": event.StateEventType, "m.rtc.slot": event.StateEventType,
+		"org.matrix.msc4143.rtc.member": event.MessageEventType, "m.rtc.member": event.MessageEventType,
+		"org.matrix.msc4075.rtc.notification": event.MessageEventType, "m.rtc.notification": event.MessageEventType,
+		"org.matrix.msc4310.rtc.decline": event.MessageEventType, "m.rtc.decline": event.MessageEventType,
+	}
+	for _, ty := range reg.types {
+		c, ok := wantClass[ty.Type]
+		if !ok || c != ty.Class {
+			t.Errorf("type %s class %v unexpected", ty.Type, ty.Class)
+		}
+		delete(wantClass, ty.Type)
+	}
+	if len(wantClass) != 0 {
+		t.Errorf("not registered: %v", wantClass)
+	}
+}

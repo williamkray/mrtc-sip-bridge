@@ -488,3 +488,58 @@ browser backup signs the device out; the origin of `public_url` holds a long-liv
 **Would revisit if:** Element X gains room widgets, a Matrix login inside the PWA becomes practical (then
 the device token could be replaced by the user's own Matrix session plus OpenID), or Web Push for call
 status is wanted.
+
+---
+
+## ADR-014: Dual-format MatrixRTC: read all, write in the owner's dialect
+
+**Status:** accepted 2026-11-19 (MATRIXRTC2-SPEC §7), implemented, pending live verification (§9 there).
+Amends the S1 "don't send sticky" guidance (S1 §1.6, ADR-002/ADR-003 still hold for legacy).
+
+**Context:** MatrixRTC is moving from per-device `call.member` state events to MSC4143 slots and sticky
+`m.rtc.member` events (MSC4354). The ecosystems disagree: matrix-js-sdk and Element Call use the unstable
+names and slot `m.call#ROOM`; matrix-rust-rtc, lk-jwt-service >= 0.10 and the client that produced the
+2026-11-19 logs (sable-next) use `m.rtc.member`, `m.rtc.slot` and `m.call#room`. A client only sees a
+membership in its own dialect. LiveKit identities also differ by endpoint (`@ghost:DEV` for `/sfu/get`,
+`hash([user, member.id])` for the MSC4195 homeserver `get_token`).
+
+**Decision:**
+- Read everything: both type names, both slot spellings, legacy and sticky (`matrixrtc.Membership`).
+- Write in the owner's dialect. Owner-initiated calls mirror the owner's sticky membership (sticky only, same
+  type name, slot spelling and transport url). Bridge-initiated calls (incoming SIP, `call`, widget) publish
+  **dual** (legacy + sticky) in the remembered dialect, else the stable names, and open **both** slot
+  spellings under **both** slot event types. Slots are never closed; a slot that declares encryption
+  refuses owner-initiated calls (and explicit `sticky`/`dual`); bridge-initiated calls under `auto` drop
+  the sticky part and ring on the legacy path.
+- Until a client has shown the new format (no dialect known for the login) `auto` does not change anything
+  an old client sees: the legacy membership content is unchanged, the ring keeps the legacy shape (slot
+  `m.call#ROOM`, `m.relates_to`, not sticky), the token comes from `sfu_get` and the sticky membership
+  names a `livekit_service_url` transport (identity `<ghost>:<DEV>`, like the legacy one). Explicit
+  `dual`/`sticky` config and a known dialect get the union ring and MSC4195.
+- `livekit_auth: auto` uses the MSC4195 homeserver `get_token` first and falls back to `/sfu/get` (the
+  sticky join is re-sent with a `livekit_service_url` transport, same `member.id`).
+- Sticky memberships carry an MSC4140 delayed leave (20 s, restarted every 7 s), a 1 h sticky duration and a
+  40 min refresh.
+- Without the sticky or delayed-event capability, or on `ErrUnsupported`, the bridge keeps the legacy path
+  (sticky paused for the login for 10 min). `matrixrtc_format: legacy` restores the old behaviour.
+- The dialect is kept in memory only. Delayed-leave cadence is fixed (20 s / 7 s), not configurable
+  (lk-jwt `delegate_delayed_leave` needs SFU webhooks).
+- With a known dialect (or explicit `sticky`/`dual`) the ring is the union of the MSC4075 shapes (sticky,
+  `slot_id`, `notification_type` kept) and is withdrawn when it ends.
+- Failures never cost the call more than the new format: an owner-mirror plan whose slot or sticky part fails
+  carries on (legacy membership after a sticky failure); a failed MSC4195 attempt (token error or a stall
+  before the connect, `get_token` bounded to 4 s) falls back to `sfu_get` without using up a join attempt
+  and the login stays on `sfu_get` for 10 min.
+- `core.GhostRTCIntent` is optional; hosts without it stay legacy. No new dependencies.
+
+**Consequences:** More events per call (up to 4 slot state events, delayed leave, join, refresh). A ghost
+with no dialect yet is visible to new-format clients only as the extra sticky membership; the first owner
+sticky membership seen teaches the dialect (memory only, lost on restart). Needs Synapse sticky, delayed
+and transports flags for the new format, plus MSC4195/appservice proxy for hashed identities; all of it
+degrades to the old path. Fallbacks (`Unstable` names, `m.call#ROOM`, the `?org.matrix.msc4140.delay`
+form) are to be deleted when the ecosystems converge. Behaviour is verified through telemetry after
+deploy, not by manual checks first.
+
+**Would revisit if:** a client cannot ring or join with the union ring or the dual membership, AS
+masquerade for `get_token` or delayed events does not work on the deployment, or MSC4075 merges with a
+different notification shape.

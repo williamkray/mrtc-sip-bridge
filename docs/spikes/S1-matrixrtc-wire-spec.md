@@ -50,8 +50,9 @@ URLs: `https://github.com/<owner>/<repo>/blob/<commit>/<path>` for each row abov
   `livekit_alias`, which Element X needs to parse the event). It gets its token from lk-jwt-service
   **`POST /sfu/get`** with an OpenID token minted for the ghost. The resulting LiveKit identity is
   `@ghost:server:DEVICEID`, and clients expect exactly that for a membership whose transport has only `livekit_service_url`.
-  The LiveKit room name is `unpaddedBase64(sha256('["<room_id>","m.call#ROOM"]'))`, the same room the
-  owner's client lands in.
+  The LiveKit room name is `unpaddedBase64(sha256('["<room_id>","m.call#room"]'))` (lk-jwt-service >= 0.10;
+  v0.9 hashed `m.call#ROOM`), the same room the owner's client lands in. Sticky memberships and MSC4195
+  tokens: see §1.6.
 
 ---
 
@@ -164,21 +165,14 @@ counts as leaving: ruma and js-sdk both treat `created_ts + expires < now` as go
   *is* the member (state key and sender). So send as the ghost via appservice masquerade
   (`?user_id=@ghost`), never as the bot.
 
-### 1.6 Newer formats (for awareness, don't send)
+### 1.6 Newer formats (sticky `rtc.member`, `rtc.slot`)
 
-- **Sticky `org.matrix.msc4143.rtc.member`** (MSC4143 + MSC4354). Content is
-  `{slot_id: "m.call#ROOM", member: {user_id, device_id, id: <uuid>, membership: "join"},
-  application: {type: "m.call", "m.call.intent": ...}, transports: {published: [...], can_subscribe:
-  ["livekit"]}, msc4354_sticky_key: <member.id>}`. Leave is `{slot_id, member: {id, membership:
-  "leave"}, msc4354_sticky_key}`. Sent with sticky duration 1 h. Needs Synapse `msc4354_enabled`.
-- **`org.matrix.msc4143.rtc.slot`** state event (state key = slot id, `{status: "open", application:
-  {type: "m.call"}}`). js-sdk ≥ v43 `parseCallNotificationContent` rejects notifications whose slot
-  doesn't exist or isn't open, and the current MSC4075 text requires it. But **no current client
-  ringing path uses that function** (Element Web has its own checks, §2.4), and Element Call
-  doesn't send slot events. Not needed for S1. Watch for it: a future Element Web may require a slot.
-  Update 2026-11: newer clients open the slot (js-sdk `ensureRtcSlotOpen`) when the user starts a call
-  from the client's call button, so portal rooms set both slot names to power level 0 as well
-  (`matrixrtc.CallPowerLevelTypes`). We still never send or read slot events.
+Superseded 2026-11-19. The earlier "for awareness, don't send" guidance no longer holds: the bridge reads
+sticky `m.rtc.member` and `rtc.slot` events and, depending on `matrixrtc_format`, publishes the sticky
+membership next to the legacy one. Wire formats (type names, slot id spellings, sticky keys, leave
+content, delayed events, transports, tokens) are in `docs/MATRIXRTC2-SPEC.md` §1, the decision table is
+§2 there, and the rationale is ADR-014 in `docs/DECISIONS.md`. The slot power level override
+(`matrixrtc.CallPowerLevelTypes`) is unchanged.
 
 ---
 
@@ -393,8 +387,10 @@ What the service does (`handler.rs process_legacy_sfu_request`, `helper.rs`):
 3. Room membership is checked **only** when lk-jwt runs as an appservice *and* the full-access list is
    exactly its own homeserver. Then the ghost must be joined to the room (it is).
 4. Identity = **`"{matrix_id}:{device_id}"`** → `@sip_15551234567:example.org:SIPAB12CD34`.
-5. LiveKit room = `unpaddedStdBase64(sha256(json(["<room>", "m.call#ROOM"])))` (slot hard-coded for
-   the legacy endpoint).
+5. LiveKit room = `unpaddedStdBase64(sha256(json(["<room>", "m.call#room"])))` (slot hard-coded for
+   the legacy endpoint). **Correction 2026-11-19:** v0.9 hashed `m.call#ROOM`; lk-jwt-service >= 0.10
+   (checked v0.10.0, `map_to_stable_m_call_slot_id`) maps `ROOM` to `room` first, so the room is the same
+   on every endpoint, including `/sfu/get`.
 6. JWT grants: roomJoin, canPublish (full access), canSubscribe, canUpdateOwnMetadata, room = alias;
    TTL 1 h; `roomCreate: false`.
 
@@ -415,7 +411,7 @@ JSON with HTML escaping off, standard base64 alphabet, no padding (lhns `identit
 same approach):
 
 ```go
-// LiveKitRoomName(roomID, "m.call#ROOM")
+// LiveKitRoomName(roomID, "m.call#room")  (lk-jwt >= 0.10; v0.9 and older hashed "m.call#ROOM")
 func hashJSON(parts ...string) string {
     var buf bytes.Buffer
     enc := json.NewEncoder(&buf)
@@ -426,7 +422,9 @@ func hashJSON(parts ...string) string {
 }
 ```
 
-Assert in S1 that the JWT's `video.room` equals `hashJSON(roomID, "m.call#ROOM")`.
+Assert in S1 that the JWT's `video.room` equals `hashJSON(roomID, "m.call#room")` (lk-jwt >= 0.10; against
+0.9 or older use `m.call#ROOM`). The implementation is `matrixrtc.LiveKitRoomAlias`, which maps either
+spelling to `room`; the hash helper moved to `pkg/matrixrtc/identity.go`.
 
 ---
 

@@ -18,9 +18,10 @@ func (c *call) onMembership(ev event) {
 	if !ok || mem.UserID != c.owner || ev.rtc.Sender != c.owner {
 		return
 	}
-	// Devices are keyed by the state key: join and leave both carry it, while content device_id exists
-	// only on join. mem.DeviceID is for logs and attributes.
-	key := ev.rtc.StateKey
+	// Devices are keyed by Membership.Key (legacy: the state key; sticky: "sticky\x00"+sticky key): join
+	// and leave both carry it, while device_id exists only on join. mem.DeviceID is for logs.
+	key := mem.Key
+	c.noteOwnerMem(mem)
 	switch c.state {
 	case stRinging:
 		if !ev.rtc.Timestamp.IsZero() && ev.rtc.Timestamp.Before(c.ringSentAt.Add(-staleMembershipSlack)) {
@@ -60,6 +61,18 @@ func (c *call) onMembership(ev event) {
 	}
 }
 
+// noteOwnerMem records a live owner membership as the freshest one (ownerMem/ownerFormat).
+func (c *call) noteOwnerMem(mem matrixrtc.Membership) {
+	if !mem.Live {
+		return
+	}
+	c.learnOwnerIdentities(mem)
+	if c.ownerMem.Key == "" || !mem.Created.Before(c.ownerMem.Created) {
+		c.ownerMem = mem
+		c.ownerFormat = mem.Format
+	}
+}
+
 func (c *call) removeDevice(device string) bool {
 	if _, ok := c.devices[device]; !ok {
 		return false
@@ -71,7 +84,7 @@ func (c *call) removeDevice(device string) bool {
 // ownerAnswered is the Ringing -> Answering transition on the owner's first live membership.
 func (c *call) ownerAnswered(ev event, mem matrixrtc.Membership) {
 	c.endRing(ev.from, outcomeAnswered)
-	c.devices[ev.rtc.StateKey] = struct{}{}
+	c.devices[mem.Key] = struct{}{}
 	c.logFor(c.setupCtx).Info().Str("device", mem.DeviceID).Msg("Owner answered")
 
 	if c.ringTimer != nil {

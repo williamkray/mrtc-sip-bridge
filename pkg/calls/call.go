@@ -46,8 +46,16 @@ type call struct {
 	triggerCtx context.Context // carries only the trigger span context (cmd.call or matrixrtc.ingest)
 	triggerAt  time.Time       // trigger time (call.outbound start)
 	ownerNotif id.EventID      // the owner's rtc.notification (owner trigger, ring mode), "" otherwise
-	cmdNumber  string          // command path by number: the normalized E.164
-	cmdRoom    bool            // command path by room (roomID set at creation)
+	// ownerFormat and ownerMem are the freshest live owner membership seen in the room (set at the owner
+	// trigger, updated by owner memberships routed to the call); zero when unknown. Actor-owned once
+	// the call runs. WP5 reads them to choose the ghost's dialect.
+	ownerFormat matrixrtc.Format
+	ownerMem    matrixrtc.Membership
+	// ownerNotifSticky is the sticky duration of the owner's notification (owner trigger), 0 = not
+	// sticky or unknown; the decline is then sent sticky too.
+	ownerNotifSticky time.Duration
+	cmdNumber        string // command path by number: the normalized E.164
+	cmdRoom          bool   // command path by room (roomID set at creation)
 
 	events   chan event
 	quit     chan struct{} // closed by shutdown (evShutdown)
@@ -78,13 +86,24 @@ type call struct {
 	memberCreated time.Time
 	memberExpires time.Duration
 
-	joinAttempt  int
-	joinInFlight bool
-	joinCancel   context.CancelFunc
-	session      rtc.Session
-	sessEvents   <-chan rtc.Event
-	lkOwners     map[string]struct{}
-	joinResults  chan event // LiveKit join results (own channel: never dropped by a full event queue)
+	// MatrixRTC 2.0 publishing (format.go, rtcmember.go), actor-owned.
+	plan            plan
+	memberID        string // sticky member.id of this call (never reused)
+	stickyEventID   id.EventID
+	stickyPublished bool
+	keeper          *delayKeeper
+	ringSticky      bool // the ring was sent sticky (withdrawn at the end)
+	ringWithdrawn   bool
+	ownerIDs        []string // LiveKit identities of the owner's live memberships (bounded)
+
+	joinAttempt   int
+	joinFallbacks int // join starts that were MSC4195 -> sfu_get switches (not counted against maxJoinAttempts)
+	joinInFlight  bool
+	joinCancel    context.CancelFunc
+	session       rtc.Session
+	sessEvents    <-chan rtc.Event
+	lkOwners      map[string]struct{}
+	joinResults   chan event // LiveKit join results (own channel: never dropped by a full event queue)
 
 	answerIssued bool
 	answerFailed bool
@@ -121,6 +140,7 @@ type call struct {
 	joinTimer    clock.Timer
 	statsTicker  clock.Ticker
 	refreshTimer clock.Timer
+	stickyTimer  clock.Timer // sticky membership refresh (MemberStickyRefresh)
 
 	bridge     media.Bridge
 	bridgeDone <-chan struct{}
@@ -167,7 +187,7 @@ func newActor(m *Manager, login core.LoginRef, cid, direction string, log zerolo
 		direction: direction,
 		events:    make(chan event, callEventBuffer),
 		// One result per attempt, so the join goroutine never blocks or drops.
-		joinResults: make(chan event, maxJoinAttempts+1),
+		joinResults: make(chan event, maxJoinAttempts+2), // +1: the free MSC4195 fallback attempt
 		quit:        make(chan struct{}),
 		done:        make(chan struct{}),
 		devices:     make(map[string]struct{}),
@@ -290,6 +310,9 @@ func (c *call) loop() {
 		case <-timerC(c.refreshTimer):
 			c.refreshTimer = nil
 			c.onRefresh()
+		case <-timerC(c.stickyTimer):
+			c.stickyTimer = nil
+			c.onStickyRefresh()
 		}
 	}
 }
@@ -509,7 +532,7 @@ func (c *call) onRTC(ev rtc.Event) {
 				return
 			}
 			c.dropSession()
-			if c.joinAttempt < maxJoinAttempts {
+			if c.canRetryJoin() {
 				c.startJoin()
 				return
 			}
@@ -574,9 +597,21 @@ func (c *call) sipHangup() {
 	}
 }
 
+// canRetryJoin reports whether another (non-fallback) join attempt is allowed.
+func (c *call) canRetryJoin() bool { return c.joinAttempt-c.joinFallbacks < maxJoinAttempts }
+
+// ringSlot is the slot_id of the ring notification.
+func (c *call) ringSlot() string {
+	if c.plan.ringSlot != "" {
+		return c.plan.ringSlot
+	}
+	return c.plan.slot
+}
+
 // stopTimers stops every state-machine timer and ticker.
 func (c *call) stopTimers() {
-	for _, t := range []*clock.Timer{&c.ringTimer, &c.answerTimer, &c.graceTimer, &c.joinTimer, &c.refreshTimer, &c.dialTimer} {
+	c.cancelKeeper() // the keeper is waited for (and its delayed leave fired) in leaveMembership
+	for _, t := range []*clock.Timer{&c.ringTimer, &c.answerTimer, &c.graceTimer, &c.joinTimer, &c.refreshTimer, &c.stickyTimer, &c.dialTimer} {
 		if *t != nil {
 			(*t).Stop()
 			*t = nil

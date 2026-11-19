@@ -53,9 +53,75 @@ core.RegisterMatrixRTCHandlers(eventProcessor, hostkit.ResolveRTCLogin(br, accep
 rtc.SetSink(callManager)
 ```
 
+`core.RegisterMatrixRTCHandlers` registers every type of `matrixrtc.IngestEventTypes()` with its class
+(bridgev2 dispatch matches type and class): the `call.member` states (`org.matrix.msc3401.call.member`,
+`m.call.member`), the `rtc.notification` and `rtc.decline` messages (unstable and stable names), the
+sticky `rtc.member` messages (`org.matrix.msc4143.rtc.member`, `m.rtc.member`) and the `rtc.slot` states
+(`org.matrix.msc4143.rtc.slot`, `m.rtc.slot`): 10 types. A host that loops over `IngestEventTypes` needs
+no change. Events are read in either dialect (MATRIXRTC2-SPEC §1); the sticky fields
+`msc4354_sticky` / `unsigned.msc4354_sticky_duration_ttl_ms` are used when the appservice push carries
+them, else a 1 h duration from `origin_server_ts`.
+
 `hostkit.ResolveRTCLogin` maps an event's room to a login and calls `accept(loginID)`; return false for
 logins without a SIP account so their rooms produce no spans. Events that arrive before `SetSink` are
 dropped by the core, so a late `Start` is safe.
+
+### 1.2a Optional `core.GhostRTCIntent` (MatrixRTC 2.0)
+
+`core.GhostIntent` is unchanged. The MatrixRTC 2.0 calls (sticky `rtc.member`, delayed leave, slots,
+transports, homeserver LiveKit tokens) live in a separate optional interface in `pkg/core/callhost.go`,
+which the call core type-asserts on the ghost:
+
+| Method | Contract |
+|---|---|
+| `SendSticky(ctx, room, type, content, d)` | Message event with MSC4354 sticky duration `d`; returns the event id. |
+| `ScheduleDelayed(ctx, room, type, content, delay, sticky)` | MSC4140 delayed event (sticky when `sticky > 0`); body endpoint first, the deprecated `?org.matrix.msc4140.delay` form on 404/`M_UNRECOGNIZED`. |
+| `UpdateDelayed(ctx, id, action)` | `restart`, `cancel` or `send`. |
+| `StateEvent(ctx, room, type, stateKey)` | Current state content, `(nil, nil)` on 404. |
+| `RTCTransports(ctx)` | Raw body of `GET /rtc/transports` (stable path, then unstable). |
+| `LiveKitToken(ctx, req)` | MSC4195 `get_token` as the ghost (stable path, then unstable); returns the JWT only. |
+| `Capabilities(ctx)` | `/versions` `unstable_features`, cached. |
+
+A feature the homeserver lacks returns `core.ErrUnsupported`. Errors never carry tokens, JWTs or query
+strings. **`hostkit.NewGhostIntent` already implements it** (`pkg/hostkit/ghostintent_rtc.go`: requests go
+through the ghost's appservice client, so they carry the `user_id` masquerade; one capability cache per
+bridge, 10 min). A host with its own `GhostIntent` that does not implement it keeps the legacy
+`call.member` path and the OpenID `/sfu/get` token, exactly as before. `calls.Config` has the matching
+fields (`MembershipFormat`, `LiveKitAuth`, `Transports`); `hostkit.NewCallStack` fills them
+from `hostkit.Config` (`matrixrtc_format`, `livekit_auth`). A `GhostRTCIntent` implementation must make
+`errors.Is(err, core.ErrNotFound)` true for a homeserver answer of `M_NOT_FOUND` (an `UpdateDelayed` on a
+delayed event that already fired or expired): the keeper uses it to re-schedule the delayed leave. There is
+no `calls.Config` callback for this any more (`IsDelayedGone` was removed in favour of the neutral
+`core.ErrNotFound` sentinel; `hostkit` matches it by errcode). `core.ErrUnsupported` keeps meaning "the
+endpoint or parameter is not there" (never a plain `M_NOT_FOUND`, `M_LIMIT_EXCEEDED`, `M_FORBIDDEN` or
+`M_TOO_LARGE`).
+
+### 1.2b Homeserver prerequisites for sticky memberships
+
+Sticky memberships need Synapse features that are behind experimental flags. With `matrixrtc_format: auto`
+(default) the bridge checks `/versions` and falls back to the legacy format when sticky events are
+missing, so none of this is required for calls to work, but it is required for the new format:
+
+```yaml
+# homeserver.yaml (names as of Synapse 1.165; check your version's docs)
+experimental_features:
+  msc4354_enabled: true   # sticky events: the m.rtc.member membership
+  msc4140_enabled: true   # delayed events: the bridge's delayed leave (a crashed bridge's call ends by itself)
+  msc4143_enabled: true   # GET /rtc/transports: where the SFU is
+max_event_delay_duration: 30s   # at least 30 s; the bridge schedules a 20 s delay and restarts it every 7 s
+```
+
+Without delayed events the sticky membership still works, but a crashed bridge leaves it up to 1 h.
+
+For LiveKit tokens through the homeserver (`livekit_auth: auto` or `msc4195`), the lk-jwt-service
+(0.10 or newer) must run in appservice-proxy mode and Synapse must forward `get_token` to it
+(`msc4502_enabled` and `msc4512_enabled` under `experimental_features`; see the lk-jwt-service README for
+the proxy settings). The bridge requests the token as the ghost over its appservice
+`user_id` masquerade, so the ghost must be joined to the room. `url` in the request must equal the
+service's `LIVEKIT_URL` byte for byte. If any of this is missing, `get_token` fails and the bridge falls
+back to `/sfu/get` with an OpenID token for that call (`livekit_auth: auto`). Telemetry shows which one was
+used (`rtc.token.endpoint`, `rtc.token.fallback`). lk-jwt-service 0.10 hashes the room slot as
+`m.call#room` for every endpoint, including `/sfu/get`.
 
 ### 1.3 Telemetry before Start
 
@@ -145,12 +211,23 @@ network:
         external_ip: <public IP of the host>
         stun_server: <host:port>
         livekit_service_url: <byte-identical to the well-known livekit service URL>
+        matrixrtc_format: auto   # auto | legacy | sticky | dual
+        livekit_auth: auto       # auto | sfu_get | msc4195
 ```
 
 The remaining `calls` keys are the same names, defaults and validation as the standalone `network:`
 section (see README "Configure"); `./jmpchat-matrix-bridge -e` prints them all. `calls.enabled: true` without
 `network.cheogram: true` is a startup error. `encryption.default: true` logs a startup warning (see
 Encrypted portals).
+
+`matrixrtc_format` is the membership format of the ghost: `auto` follows your client (a call you start
+from a client that publishes sticky `m.rtc.member` events is answered in the same dialect; calls the bridge
+starts, i.e. incoming SIP calls, `call` and the widget, publish both the legacy `call.member` and the sticky
+membership, and fall back to legacy when the homeserver has no sticky events), `legacy` is the behaviour
+before MatrixRTC 2.0, `sticky` and `dual` force one of the two. `livekit_auth` is how the ghost gets its
+LiveKit token: `auto` tries the homeserver `get_token` (MSC4195) first and falls back to lk-jwt-service
+`/sfu/get`, `sfu_get` never uses `get_token`, `msc4195` never falls back. Synapse prerequisites: 1.2b.
+Both keys are copied by `hostkit.CopyKeys` (jmpchat-matrix-bridge: under `network.calls`).
 
 A ready-to-adapt service config and compose snippet live in `docs/PHASEJ-SPEC.md` §9.3 (local copies
 in the gitignored `deploy-dev/jabbercalls/`).
@@ -214,6 +291,9 @@ public jabber build:
   `bridge.calls.inbound_filtered` (roster-only rejection), `cmd.roster_only_calls`, `cmd.save_contact`,
   `cmd.sip_login`, `cmd.sip_login.submit` (root consumer),
   `cmd.sip_logout`, `cmd.sip_status`, `cmd.call`, `cmd.hangup`, `cmd.dtmf`.
+- MatrixRTC 2.0 adds the child spans `matrixrtc.plan.choose`, `matrixrtc.slot.open`,
+  `matrixrtc.member.publish`, `matrixrtc.member.leave` and `matrixrtc.ring.withdraw`, and the metric
+  `mrtcsip.matrixrtc.delayed_leave.restarts` (`docs/TELEMETRY-SPEC.md` §4.3, §5.6).
 - Log lines under spans carry `trace_id`/`span_id`/`dd.trace_id`/`dd.span_id` exactly once.
 - Matrix HTTP calls are traced (jabber's transport wrapper) but there are no Matrix HTTP metrics in
   embedded mode.

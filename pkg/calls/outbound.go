@@ -161,9 +161,7 @@ func (c *call) setupOutbound() bool {
 			return c.failOutOnStop()
 		}
 		if err := c.publishMembership(ctx); err != nil {
-			c.logFor(ctx).Warn().Str("error", scrubErr(err)).Msg("Failed to publish the ghost call membership")
-			c.failOutbound(c.noAudioFail())
-			return false
+			return c.failOutPublish(ctx, err)
 		}
 		if c.stopRequested() {
 			return c.failOutOnStop()
@@ -189,9 +187,7 @@ func (c *call) setupOutbound() bool {
 
 	// 7. Owner-initiated: ghost membership, then join before dialling (D4, D5).
 	if err := c.publishMembership(ctx); err != nil {
-		c.logFor(ctx).Warn().Str("error", scrubErr(err)).Msg("Failed to publish the ghost call membership")
-		c.failOutbound(c.noAudioFail())
-		return false
+		return c.failOutPublish(ctx, err)
 	}
 	if c.stopRequested() {
 		return c.failOutOnStop()
@@ -201,6 +197,18 @@ func (c *call) setupOutbound() bool {
 		Msg("Owner started a call")
 	c.startJoin()
 	return true
+}
+
+// failOutPublish is the outbound failure for a membership publish error; it returns false. A slot that
+// declares encryption is refused like an encrypted room.
+func (c *call) failOutPublish(ctx context.Context, err error) bool {
+	if errors.Is(err, errSlotEncrypted) {
+		c.failOutbound(failSpec{outcome: outcomeRejected, reason: reasonRejected, notice: noticeOutEncrypted, decline: true})
+		return false
+	}
+	c.logFor(ctx).Warn().Str("error", scrubErr(err)).Msg("Failed to publish the ghost call membership")
+	c.failOutbound(c.noAudioFail())
+	return false
 }
 
 // noAudioFail is the failure for LiveKit/membership/service URL problems before dialling.
@@ -543,7 +551,8 @@ func (c *call) onOutMembership(ev event) {
 	if !ok || mem.UserID != c.owner || ev.rtc.Sender != c.owner {
 		return
 	}
-	key := ev.rtc.StateKey
+	key := mem.Key
+	c.noteOwnerMem(mem)
 	switch c.state {
 	case stRinging:
 		if !ev.rtc.Timestamp.IsZero() && ev.rtc.Timestamp.Before(c.ringSentAt.Add(-staleMembershipSlack)) {
@@ -644,7 +653,7 @@ func (c *call) onOutDisconnected() {
 	switch c.state {
 	case stRinging, stJoining:
 		c.dropSession()
-		if c.joinAttempt < maxJoinAttempts {
+		if c.canRetryJoin() {
 			c.startJoin()
 			return
 		}
@@ -688,6 +697,7 @@ func (c *call) failOutbound(f failSpec) {
 		if f.outcome != outcomeDeclined {
 			c.redactRing(ctx)
 		}
+		c.withdrawRing(ctx)
 	}
 
 	// 5. Early bridge and ringback tone.
@@ -708,10 +718,8 @@ func (c *call) failOutbound(f failSpec) {
 		c.sendDecline(ctx)
 	}
 
-	// 8. Ghost membership and LiveKit.
-	if c.memberEventID != "" {
-		c.clearMembership(ctx)
-	}
+	// 8. Ghost membership (sticky leave, then the legacy clear) and LiveKit.
+	c.leaveMembership(ctx)
 	if c.session != nil {
 		c.leaveSession(ctx, c.session)
 		c.session = nil
@@ -776,12 +784,21 @@ func (c *call) playFailureTone(p media.TonePattern) {
 }
 
 // sendDecline sends the MSC4310 decline of the owner's notification (matrixrtc.decline.send), best
-// effort.
+// effort. A decline of a sticky notification is sent sticky with the notification's duration.
 func (c *call) sendDecline(ctx context.Context) {
 	sctx, span := c.child(ctx, "matrixrtc.decline.send", trace.SpanKindClient,
 		obs.AttrCallID.String(c.id), obs.AttrMatrixEventID.String(c.ownerNotif.String()))
 	octx, cancel := context.WithTimeout(sctx, matrixOpTimeout)
-	_, err := c.room.Ghost.SendMessage(octx, c.room.RoomID, matrixrtc.RTCDecline, matrixrtc.DeclineContent(c.ownerNotif))
+	var err error
+	content := matrixrtc.DeclineContent(c.ownerNotif)
+	if g, ok := c.rtcGhost(); ok && c.ownerNotifSticky > 0 {
+		_, err = g.SendSticky(octx, c.room.RoomID, matrixrtc.RTCDecline, content, c.ownerNotifSticky)
+		if errors.Is(err, core.ErrUnsupported) {
+			_, err = c.room.Ghost.SendMessage(octx, c.room.RoomID, matrixrtc.RTCDecline, content)
+		}
+	} else {
+		_, err = c.room.Ghost.SendMessage(octx, c.room.RoomID, matrixrtc.RTCDecline, content)
+	}
 	cancel()
 	if err != nil {
 		obs.Fail(span, err)

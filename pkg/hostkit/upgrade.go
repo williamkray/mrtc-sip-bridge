@@ -34,6 +34,8 @@ func CopyKeys(h configupgrade.Helper, path ...string) {
 	h.Copy(configupgrade.Int, at("rtp_timeout_seconds")...)
 	h.Copy(configupgrade.Str, at("livekit_service_url")...)
 	h.Copy(configupgrade.Str, at("default_country_code")...)
+	h.Copy(configupgrade.Str, at("matrixrtc_format")...)
+	h.Copy(configupgrade.Str, at("livekit_auth")...)
 	h.Copy(configupgrade.Str, at("outbound_trigger")...)
 	h.Copy(configupgrade.Int, at("dial_timeout_seconds")...)
 	h.Copy(configupgrade.List, at("dial_allowed_prefixes")...)

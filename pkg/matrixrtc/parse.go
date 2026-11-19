@@ -17,6 +17,8 @@ const (
 	KindCallMember
 	KindRTCNotification
 	KindRTCDecline
+	KindRTCMember
+	KindRTCSlot
 )
 
 // String returns a stable lowercase name for logging.
@@ -28,6 +30,10 @@ func (k EventKind) String() string {
 		return "rtc_notification"
 	case KindRTCDecline:
 		return "rtc_decline"
+	case KindRTCMember:
+		return "rtc_member"
+	case KindRTCSlot:
+		return "rtc_slot"
 	default:
 		return "unknown"
 	}
@@ -45,11 +51,15 @@ type Event struct {
 	IsState   bool
 	Timestamp time.Time       // from origin_server_ts (UnixMilli); zero if 0
 	Content   json.RawMessage // never nil for a returned event; "{}" if the event had no content
+
+	StickyDuration  time.Duration // evt.Sticky.GetDuration() (clamped to 1 h); 0 = not sticky or unknown
+	StickyRemaining time.Duration // evt.Unsigned.StickyDurationTTL (clamped to 1 h); 0 = absent
+	Redacted        bool          // evt.Unsigned.RedactedBecause != nil
 }
 
 // KindOf maps a type (Type AND Class must match one of events.go) to a kind.
 // CallMember/CallMemberAlias -> KindCallMember; RTCNotification/Alias -> KindRTCNotification;
-// RTCDecline/Alias -> KindRTCDecline; anything else (including a known name with the wrong Class) -> KindUnknown.
+// RTCDecline/Alias -> KindRTCDecline; RTCMember/Alias -> KindRTCMember; RTCSlot/Alias -> KindRTCSlot; anything else (including a known name with the wrong Class) -> KindUnknown.
 func KindOf(t event.Type) EventKind {
 	switch t {
 	case CallMember, CallMemberAlias:
@@ -58,6 +68,10 @@ func KindOf(t event.Type) EventKind {
 		return KindRTCNotification
 	case RTCDecline, RTCDeclineAlias:
 		return KindRTCDecline
+	case RTCMember, RTCMemberAlias:
+		return KindRTCMember
+	case RTCSlot, RTCSlotAlias:
+		return KindRTCSlot
 	default:
 		return KindUnknown
 	}
@@ -81,6 +95,10 @@ func FromMatrixEvent(evt *event.Event) (Event, bool) {
 		EventID: evt.ID,
 		Sender:  evt.Sender,
 		IsState: evt.StateKey != nil,
+
+		StickyDuration:  evt.Sticky.GetDuration(),
+		StickyRemaining: max(0, min(evt.Unsigned.StickyDurationTTL.Duration, event.MaxStickyDuration)),
+		Redacted:        evt.Unsigned.RedactedBecause != nil,
 	}
 	if evt.StateKey != nil {
 		out.StateKey = *evt.StateKey

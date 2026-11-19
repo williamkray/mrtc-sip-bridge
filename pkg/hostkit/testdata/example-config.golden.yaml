@@ -23,6 +23,21 @@ rtp_timeout_seconds: 60
 # lk-jwt-service (MatrixRTC auth service) URL, e.g. https://matrix-rtc.example.org/livekit/jwt.
 # Empty = discover from https://<homeserver.domain>/.well-known/matrix/client (org.matrix.msc4143.rtc_foci).
 livekit_service_url: ""
+# Format of the call membership the bridge publishes for its phone-number user (MatrixRTC 2.0).
+#   auto    follow your client: when you start a call from a client that uses sticky m.rtc.member
+#           events, answer in the same format; for calls the bridge starts (incoming SIP calls,
+#           "call" command) publish both the legacy call.member and the sticky m.rtc.member, and fall
+#           back to the legacy format only when the homeserver lacks sticky events (MSC4354)
+#   legacy  only the legacy org.matrix.msc3401.call.member state event (the behaviour before MatrixRTC 2.0)
+#   sticky  only the sticky m.rtc.member event
+#   dual    always both
+matrixrtc_format: auto
+# How the bridge gets its LiveKit token as the phone-number user.
+#   auto     homeserver get_token (MSC4195, needs Synapse msc4512 and lk-jwt-service in appservice
+#            mode); if that fails, lk-jwt-service /sfu/get with an OpenID token
+#   sfu_get  always lk-jwt-service /sfu/get (the behaviour before MatrixRTC 2.0)
+#   msc4195  only the homeserver get_token
+livekit_auth: auto
 # Country calling code assumed for numbers without a leading + (1 = North America).
 default_country_code: "1"
 # How the bridge recognises that you started a call in a number's room:

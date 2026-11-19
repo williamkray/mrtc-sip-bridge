@@ -3,12 +3,15 @@ package core
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/williamkray/mrtc-sip-bridge/internal/obstest"
 	"github.com/williamkray/mrtc-sip-bridge/pkg/matrixrtc"
@@ -152,5 +155,92 @@ func TestIngestSetLocalNumber(t *testing.T) {
 	}
 	if got := obstest.Attr(spans[1], "call.local.e164").AsString(); got != "+15551234567" {
 		t.Errorf("nil SetLocalNumber: call.local.e164 = %q", got)
+	}
+}
+
+func TestIngestSpanMembershipAttrs(t *testing.T) {
+	env := obstest.Setup(t)
+	in := NewIngest(&fakeSink{})
+	ghost := id.UserID("@ghost:example.org")
+
+	sticky := &event.Event{
+		Type: matrixrtc.RTCMember, RoomID: "!room:example.org", ID: "$st", Sender: ghost,
+		Content: event.Content{Raw: matrixrtc.StickyJoinContent(matrixrtc.StickyJoinParams{
+			UserID: ghost, DeviceID: "DEV1", MemberID: "mem-1", SlotID: matrixrtc.SlotIDRoom})},
+	}
+	legacy := &event.Event{
+		Type: matrixrtc.CallMember, RoomID: "!room:example.org", ID: "$lg", Sender: ghost,
+		StateKey: ptr(matrixrtc.MemberStateKey(ghost, "DEV2")),
+		Content: event.Content{Raw: matrixrtc.JoinContent(matrixrtc.JoinParams{
+			UserID: ghost, DeviceID: "DEV2", RoomID: "!room:example.org", ServiceURL: "https://lk.example.org",
+			CreatedTS: time.Now(), Expires: time.Hour})},
+	}
+	slot := &event.Event{
+		Type: matrixrtc.RTCSlot, RoomID: "!room:example.org", ID: "$sl", Sender: "@owner:example.org",
+		StateKey: ptr(matrixrtc.SlotIDRoom), Content: event.Content{Raw: matrixrtc.SlotOpenContent()},
+	}
+	for _, e := range []*event.Event{sticky, legacy, slot, knownEvent()} {
+		if !in.HandleMatrixRTCEvent(context.Background(), "login1", e) {
+			t.Fatalf("event %s not handled", e.ID)
+		}
+	}
+	spans := env.SpansByName("matrixrtc.ingest")
+	if len(spans) != 4 {
+		t.Fatalf("%d spans", len(spans))
+	}
+	has := func(i int, key string) bool {
+		for _, a := range spans[i].Attributes() {
+			if string(a.Key) == key {
+				return true
+			}
+		}
+		return false
+	}
+	str := func(i int, key string) string { return obstest.Attr(spans[i], key).AsString() }
+
+	if str(0, "matrixrtc.membership.format") != "sticky" || str(0, "matrixrtc.slot_id") != matrixrtc.SlotIDRoom ||
+		str(0, "matrixrtc.membership.device_id") != "DEV1" {
+		t.Errorf("sticky attrs wrong: %v", spans[0].Attributes())
+	}
+	if str(1, "matrixrtc.membership.format") != "legacy" || str(1, "matrixrtc.membership.device_id") != "DEV2" ||
+		str(1, "matrixrtc.slot_id") != matrixrtc.SlotIDRoomLegacy {
+		t.Errorf("legacy attrs wrong: %v", spans[1].Attributes())
+	}
+	if has(2, "matrixrtc.membership.format") || str(2, "matrixrtc.slot_id") != matrixrtc.SlotIDRoom {
+		t.Errorf("slot attrs wrong: %v", spans[2].Attributes())
+	}
+	if has(3, "matrixrtc.membership.format") || has(3, "matrixrtc.slot_id") || has(3, "matrixrtc.membership.device_id") {
+		t.Errorf("notification span has membership attrs: %v", spans[3].Attributes())
+	}
+	if str(2, "matrixrtc.kind") != "rtc_slot" || str(0, "matrixrtc.kind") != "rtc_member" {
+		t.Errorf("kinds: %s %s", str(2, "matrixrtc.kind"), str(0, "matrixrtc.kind"))
+	}
+}
+
+func ptr(s string) *string { return &s }
+
+// The slot id of an event is sender-controlled: only the two room spellings are recorded, anything else
+// is "other".
+func TestMemberAttrsSlotIDIsClosedSet(t *testing.T) {
+	slotAttr := func(evt matrixrtc.Event) string {
+		for _, a := range memberAttrs(evt, time.Now()) {
+			if string(a.Key) == "matrixrtc.slot_id" {
+				return a.Value.AsString()
+			}
+		}
+		return ""
+	}
+	for key, want := range map[string]string{matrixrtc.SlotIDRoom: matrixrtc.SlotIDRoom, "m.call#evil-1234": "other"} {
+		if got := slotAttr(matrixrtc.Event{Kind: matrixrtc.KindRTCSlot, StateKey: key}); got != want {
+			t.Errorf("slot event %q: attr %q, want %q", key, got, want)
+		}
+	}
+	// A sticky membership with an unknown slot id still parses (not live); its attribute is "other".
+	ghost := id.UserID("@ghost:example.org")
+	raw := matrixrtc.StickyJoinContent(matrixrtc.StickyJoinParams{UserID: ghost, DeviceID: "D", MemberID: "m", SlotID: "m.call#evil-1234"})
+	b, _ := json.Marshal(raw)
+	evt := matrixrtc.Event{Kind: matrixrtc.KindRTCMember, Type: matrixrtc.RTCMember.Type, Sender: ghost, Content: b, Timestamp: time.Now()}
+	if got := slotAttr(evt); got != "other" {
+		t.Errorf("member slot attr %q", got)
 	}
 }

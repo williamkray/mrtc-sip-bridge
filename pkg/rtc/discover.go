@@ -1,11 +1,7 @@
 package rtc
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,7 +20,6 @@ import (
 const (
 	discoverTimeout = 5 * time.Second
 	negativeTTL     = 60 * time.Second
-	roomSlotID      = "m.call#ROOM"
 )
 
 var errNoFoci = errors.New("no " + matrixrtc.WellKnownRTCFociKey + " livekit entry in .well-known; set network.livekit_service_url")
@@ -156,20 +151,44 @@ func (r *ServiceURLResolver) source() string {
 	return ""
 }
 
-// hashJSON is lk-jwt-service's livekit_room_alias_for: sha256 of the compact JSON array (HTML escaping
-// off), standard base64, no padding.
-func hashJSON(parts ...string) string {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	_ = enc.Encode(parts)
-	sum := sha256.Sum256(bytes.TrimSuffix(buf.Bytes(), []byte("\n")))
-	return base64.RawStdEncoding.EncodeToString(sum[:])
+func liveKitRoomName(roomID id.RoomID) string {
+	return matrixrtc.LiveKitRoomAlias(roomID, matrixrtc.SlotIDRoom)
 }
 
-func liveKitRoomName(roomID id.RoomID) string { return hashJSON(string(roomID), roomSlotID) }
+// ownerMatcher decides which LiveKit identities are owner devices: an exact identity set (MSC4195 hashed
+// identities, extended at runtime) plus the legacy prefix "<owner>:". Safe for concurrent use.
+type ownerMatcher struct {
+	prefix string // "" = no legacy prefix
 
-// isOwner reports whether a LiveKit identity belongs to the owner ("<owner>:<device>").
-func isOwner(identity string, owner id.UserID) bool {
-	return strings.HasPrefix(identity, string(owner)+":")
+	mu  sync.RWMutex
+	ids map[string]struct{}
+}
+
+func newOwnerMatcher(owner id.UserID, ids []string) *ownerMatcher {
+	m := &ownerMatcher{ids: make(map[string]struct{}, len(ids))}
+	if owner != "" {
+		m.prefix = string(owner) + ":"
+	}
+	m.add(ids...)
+	return m
+}
+
+func (m *ownerMatcher) add(ids ...string) {
+	m.mu.Lock()
+	for _, i := range ids {
+		if i != "" {
+			m.ids[i] = struct{}{}
+		}
+	}
+	m.mu.Unlock()
+}
+
+func (m *ownerMatcher) match(identity string) bool {
+	if m.prefix != "" && strings.HasPrefix(identity, m.prefix) {
+		return true
+	}
+	m.mu.RLock()
+	_, ok := m.ids[identity]
+	m.mu.RUnlock()
+	return ok
 }

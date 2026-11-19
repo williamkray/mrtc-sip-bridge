@@ -32,6 +32,11 @@ type Config struct {
 	LiveKitServiceURL      string `yaml:"livekit_service_url"`
 	DefaultCountryCode     string `yaml:"default_country_code"`
 
+	// MatrixRTC 2.0 (docs/MATRIXRTC2-SPEC.md): membership format "auto" | "legacy" | "sticky" | "dual"
+	// and LiveKit token auth "auto" | "sfu_get" | "msc4195". Empty = "auto".
+	MatrixRTCFormat string `yaml:"matrixrtc_format"`
+	LiveKitAuth     string `yaml:"livekit_auth"`
+
 	// Outbound calls (Phase 3).
 	OutboundTrigger     string   `yaml:"outbound_trigger"`
 	DialTimeoutSeconds  int      `yaml:"dial_timeout_seconds"`
@@ -96,6 +101,8 @@ const (
 	defaultRTPTimeoutSeconds      = 60
 	defaultCountryCode            = "1"
 	defaultOutboundTrigger        = "ring"
+	defaultMatrixRTCFormat        = "auto"
+	defaultLiveKitAuth            = "auto"
 	defaultDialTimeoutSeconds     = 60
 	defaultDialNumberFormat       = "digits"
 	defaultSTUNServer             = "stun.l.google.com:19302" // only used in the example YAML
@@ -121,6 +128,12 @@ func (c *Config) ApplyDefaults() {
 		c.DefaultCountryCode = defaultCountryCode
 	}
 	setInt(&c.DialTimeoutSeconds, defaultDialTimeoutSeconds)
+	if c.MatrixRTCFormat == "" {
+		c.MatrixRTCFormat = defaultMatrixRTCFormat
+	}
+	if c.LiveKitAuth == "" {
+		c.LiveKitAuth = defaultLiveKitAuth
+	}
 	if c.OutboundTrigger == "" {
 		c.OutboundTrigger = defaultOutboundTrigger
 	}
@@ -229,6 +242,16 @@ func (c *Config) Validate(prefix string) error {
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return fmt.Errorf("%slivekit_service_url: %q is not an absolute http(s) URL", prefix, c.LiveKitServiceURL)
 		}
+	}
+	switch c.MatrixRTCFormat {
+	case "auto", "legacy", "sticky", "dual":
+	default:
+		return fmt.Errorf("%smatrixrtc_format: %q must be auto, legacy, sticky or dual", prefix, c.MatrixRTCFormat)
+	}
+	switch c.LiveKitAuth {
+	case "auto", "sfu_get", "msc4195":
+	default:
+		return fmt.Errorf("%slivekit_auth: %q must be auto, sfu_get or msc4195", prefix, c.LiveKitAuth)
 	}
 	cc := c.DefaultCountryCode
 	if len(cc) < 1 || len(cc) > 3 || cc[0] == '0' {

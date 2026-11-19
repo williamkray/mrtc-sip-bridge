@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"time"
 
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
@@ -29,6 +30,42 @@ type GhostIntent interface {
 	SendMessage(ctx context.Context, roomID id.RoomID, evtType event.Type, content map[string]any) (id.EventID, error)
 	Redact(ctx context.Context, roomID id.RoomID, eventID id.EventID, reason string) error
 	RequestOpenIDToken(ctx context.Context) (*OpenIDToken, error)
+}
+
+// GhostRTCIntent is the optional MatrixRTC 2.0 capability of a GhostIntent (MSC4143 slots, MSC4354
+// sticky m.rtc.member, MSC4140 delayed events, MSC4195 homeserver LiveKit tokens; docs/MATRIXRTC2-SPEC.md).
+// Callers type-assert it; a ghost without it (or a homeserver returning ErrUnsupported) gets the legacy
+// call.member path. Implementations act as the ghost (appservice masquerade) and never put tokens,
+// JWTs or query strings into errors.
+type GhostRTCIntent interface {
+	// SendSticky sends a message event with sticky duration d. Returns the event id.
+	SendSticky(ctx context.Context, roomID id.RoomID, t event.Type, content map[string]any, d time.Duration) (id.EventID, error)
+	// ScheduleDelayed schedules content to be sent after delay; sticky > 0 makes it a sticky delayed
+	// event. New body endpoint first, then the deprecated query form on 404/M_UNRECOGNIZED.
+	ScheduleDelayed(ctx context.Context, roomID id.RoomID, t event.Type, content map[string]any, delay, sticky time.Duration) (DelayedEventID, error)
+	// UpdateDelayed applies action ("restart", "cancel" or "send") to a scheduled delayed event.
+	UpdateDelayed(ctx context.Context, did DelayedEventID, action string) error
+	// StateEvent returns the current state content, or (nil, nil) when there is none (404).
+	StateEvent(ctx context.Context, roomID id.RoomID, t event.Type, stateKey string) (map[string]any, error)
+	// RTCTransports returns the raw body of the MSC4143 transports endpoint (stable path, then
+	// unstable), parsed by matrixrtc.ParseTransports.
+	RTCTransports(ctx context.Context) ([]byte, error)
+	// LiveKitToken requests a LiveKit JWT from the homeserver C-S get_token endpoint (MSC4195, stable
+	// path then unstable) as the ghost. Returns the JWT only.
+	LiveKitToken(ctx context.Context, req LiveKitTokenRequest) (string, error)
+	// Capabilities returns the homeserver's /versions unstable_features (cached; errors give an empty map).
+	Capabilities(ctx context.Context) map[string]bool
+}
+
+// DelayedEventID is the MSC4140 delay_id of a scheduled delayed event.
+type DelayedEventID string
+
+// LiveKitTokenRequest is the MSC4195 get_token request body (url, room_id, slot_id, member_id).
+type LiveKitTokenRequest struct {
+	URL      string // LiveKit SFU URL; must match the auth service's configured URL exactly
+	RoomID   id.RoomID
+	SlotID   string
+	MemberID string
 }
 
 // CallRoom is the Matrix room in which calls with one remote number ring, plus the ghost for that number.
@@ -68,4 +105,11 @@ var (
 	ErrUnknownLogin = errors.New("core: unknown login")
 	// ErrNoDoublePuppet is returned by MarkReadAsOwner when the owner has no double puppet.
 	ErrNoDoublePuppet = errors.New("core: owner has no double puppet")
+	// ErrUnsupported is returned by GhostRTCIntent methods when the homeserver does not support the
+	// feature (HTTP 404, M_UNRECOGNIZED, or a 400 rejecting the sticky/delay parameter).
+	ErrUnsupported = errors.New("core: homeserver does not support this MatrixRTC feature")
+	// ErrNotFound is matched (errors.Is) by GhostRTCIntent errors for a homeserver answer of M_NOT_FOUND:
+	// the addressed object does not exist (e.g. UpdateDelayed on a delayed event that already fired or
+	// expired). It is not ErrUnsupported: the endpoint exists.
+	ErrNotFound = errors.New("core: not found on the homeserver")
 )

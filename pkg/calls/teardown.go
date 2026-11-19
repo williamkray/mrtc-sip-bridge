@@ -47,10 +47,10 @@ func (c *call) fail(f failSpec) {
 	if c.ringEventID != "" && f.outcome != outcomeDeclined {
 		c.redactRing(ctx)
 	}
-	// 4. Clear the ghost membership.
-	if c.memberEventID != "" {
-		c.clearMembership(ctx)
-	}
+	// 3b. Withdraw a sticky ring.
+	c.withdrawRing(ctx)
+	// 4. Leave the ghost membership (sticky leave, then the legacy clear).
+	c.leaveMembership(ctx)
 	// 5. Leave LiveKit.
 	if c.session != nil {
 		c.leaveSession(ctx, c.session)
@@ -122,10 +122,9 @@ func (c *call) teardown(by, reason string, remoteBye bool) {
 		c.session = nil
 		c.sessEvents = nil
 	}
-	// 4. Clear the ghost membership.
-	if c.memberEventID != "" {
-		c.clearMembership(ctx)
-	}
+	// 4. Withdraw a sticky ring, then leave the ghost membership (sticky leave, then the legacy clear).
+	c.withdrawRing(ctx)
+	c.leaveMembership(ctx)
 	// 5. Notice with the talk time.
 	if c.room != nil {
 		text := answeredNotice(c.endedAt.Sub(c.answeredAt))

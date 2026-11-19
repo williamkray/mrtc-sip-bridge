@@ -2,6 +2,7 @@ package calls
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -18,13 +19,15 @@ import (
 type memberSeen struct {
 	created time.Time // membership created_ts (or event timestamp)
 	eventID id.EventID
-	seenAt  time.Time // when the bridge received it
+	seenAt  time.Time            // when the bridge received it
+	mem     matrixrtc.Membership // parsed membership: identities, url and format at trigger time
 }
 
 // notifSeen is an owner notification waiting for a fresh owner membership (ring mode).
 type notifSeen struct {
 	eventID id.EventID
 	seenAt  time.Time
+	sticky  time.Duration // sticky duration of the notification, 0 = not sticky
 }
 
 // within reports whether t is within d of now in either direction (future skew allowed).
@@ -39,7 +42,7 @@ func within(now, t time.Time, d time.Duration) bool {
 // detect is the owner-trigger detector (PHASE3-SPEC §6.3) for events not routed to an active call. It
 // runs on the appservice path: only OwnerMXID, parsing and map operations, never I/O or blocking.
 func (m *Manager) detect(ctx context.Context, login core.LoginRef, evt matrixrtc.Event) {
-	if evt.Kind != matrixrtc.KindCallMember && evt.Kind != matrixrtc.KindRTCNotification {
+	if evt.Kind != matrixrtc.KindCallMember && evt.Kind != matrixrtc.KindRTCMember && evt.Kind != matrixrtc.KindRTCNotification {
 		return
 	}
 	owner := m.cfg.Host.OwnerMXID(login)
@@ -50,30 +53,31 @@ func (m *Manager) detect(ctx context.Context, login core.LoginRef, evt matrixrtc
 	var c *call
 	var refused string
 	notif := id.EventID("")
+	var notifSticky time.Duration
 
 	switch evt.Kind {
-	case matrixrtc.KindCallMember:
+	case matrixrtc.KindCallMember, matrixrtc.KindRTCMember:
 		mem, ok := matrixrtc.ParseMembership(evt, now)
 		if !ok || mem.UserID != owner {
 			return
 		}
 		fresh := mem.Live && within(now, mem.Created, triggerFreshness) && within(now, evt.Timestamp, triggerFreshness)
 		m.mu.Lock()
-		_, existed := m.ownerLive[login][evt.RoomID][evt.StateKey]
+		_, existed := m.ownerLive[login][evt.RoomID][mem.Key]
 		othersLive := m.updateOwnerLiveLocked(login, evt, mem, now)
 		trigger := false
 		if fresh {
 			switch m.mode {
 			case modeRing:
 				if p, ok := m.pendingNotif[login][evt.RoomID]; ok && now.Sub(p.seenAt) <= triggerPairWindow {
-					notif, trigger = p.eventID, true
+					notif, notifSticky, trigger = p.eventID, p.sticky, true
 				}
 			case modeMembership:
 				trigger = !othersLive && !existed
 			}
 		}
 		if trigger {
-			c, refused = m.triggerLocked(ctx, login, evt.RoomID, notif, now)
+			c, refused = m.triggerLocked(ctx, login, evt.RoomID, notif, notifSticky, now)
 		}
 		m.mu.Unlock()
 		if !trigger {
@@ -83,7 +87,13 @@ func (m *Manager) detect(ctx context.Context, login core.LoginRef, evt matrixrtc
 		if m.mode != modeRing {
 			return
 		}
-		if _, ok := matrixrtc.ParseNotification(evt); !ok {
+		n, ok := matrixrtc.ParseNotification(evt)
+		if !ok || n.Withdrawn {
+			return
+		}
+		// A new-format notification has no m.relates_to and no notification_type: pairing never needs
+		// either. Only a notification for another slot than the room call is not a trigger.
+		if n.SlotID != "" && !matrixrtc.IsRoomSlot(n.SlotID) {
 			return
 		}
 		if !within(now, evt.Timestamp, triggerFreshness) {
@@ -100,8 +110,8 @@ func (m *Manager) detect(ctx context.Context, login core.LoginRef, evt matrixrtc
 			}
 		}
 		if joined {
-			notif = evt.EventID
-			c, refused = m.triggerLocked(ctx, login, evt.RoomID, notif, now)
+			notif, notifSticky = evt.EventID, notificationSticky(evt)
+			c, refused = m.triggerLocked(ctx, login, evt.RoomID, notif, notifSticky, now)
 		} else {
 			m.storePendingLocked(login, evt, now)
 		}
@@ -151,13 +161,13 @@ func (m *Manager) updateOwnerLiveLocked(login core.LoginRef, evt matrixrtc.Event
 	devs := rooms[evt.RoomID]
 	others := false
 	for k := range devs {
-		if k != evt.StateKey {
+		if k != mem.Key {
 			others = true
 			break
 		}
 	}
 	if !mem.Live {
-		delete(devs, evt.StateKey)
+		delete(devs, mem.Key)
 		if len(devs) == 0 {
 			delete(rooms, evt.RoomID)
 		}
@@ -170,7 +180,10 @@ func (m *Manager) updateOwnerLiveLocked(login core.LoginRef, evt matrixrtc.Event
 		devs = make(map[string]memberSeen)
 		rooms[evt.RoomID] = devs
 	}
-	devs[evt.StateKey] = memberSeen{created: mem.Created, eventID: evt.EventID, seenAt: now}
+	devs[mem.Key] = memberSeen{created: mem.Created, eventID: evt.EventID, seenAt: now, mem: mem}
+	if mem.Format == matrixrtc.FormatSticky {
+		m.noteDialectLocked(login, mem, now)
+	}
 	return others
 }
 
@@ -203,7 +216,7 @@ func (m *Manager) storePendingLocked(login core.LoginRef, evt matrixrtc.Event, n
 			delete(rooms, room)
 		}
 	}
-	rooms[evt.RoomID] = notifSeen{eventID: evt.EventID, seenAt: now}
+	rooms[evt.RoomID] = notifSeen{eventID: evt.EventID, seenAt: now, sticky: notificationSticky(evt)}
 }
 
 // setCooldownLocked starts the per-room trigger cooldown, pruning expired entries. m.mu must be held.
@@ -222,7 +235,8 @@ func (m *Manager) setCooldownLocked(room id.RoomID, now time.Time) {
 // triggerLocked creates the actor for an owner trigger, or returns the reason it was refused. An active
 // call in another room yields a busy actor (not active, not routable). The caller starts the actor after
 // releasing m.mu. m.mu must be held.
-func (m *Manager) triggerLocked(ctx context.Context, login core.LoginRef, room id.RoomID, notif id.EventID, now time.Time) (*call, string) {
+func (m *Manager) triggerLocked(ctx context.Context, login core.LoginRef, room id.RoomID, notif id.EventID,
+	notifSticky time.Duration, now time.Time) (*call, string) {
 	if p, ok := m.pendingNotif[login][room]; ok && p.eventID == notif {
 		delete(m.pendingNotif[login], room)
 	}
@@ -244,12 +258,23 @@ func (m *Manager) triggerLocked(ctx context.Context, login core.LoginRef, room i
 	c := newOutCall(m, login, triggerOwnerMembership, trace.SpanContextFromContext(ctx), now)
 	c.roomID = room
 	c.ownerNotif = notif
+	c.ownerNotifSticky = notifSticky
 	if m.active[login] != nil {
 		c.busy = true
 		m.setCooldownLocked(room, now)
 	} else {
-		for k := range m.ownerLive[login][room] {
+		for k, s := range m.ownerLive[login][room] {
 			c.devices[k] = struct{}{}
+			if !s.mem.Live {
+				continue
+			}
+			// Every live owner device may be the one that joins LiveKit, so all of their identities are
+			// accepted (deduplicated, capped); the freshest membership is the dialect source.
+			c.learnOwnerIdentities(s.mem)
+			if c.ownerMem.Key == "" || !s.mem.Created.Before(c.ownerMem.Created) {
+				c.ownerMem = s.mem
+				c.ownerFormat = s.mem.Format
+			}
 		}
 		m.active[login] = c
 		m.routable[login] = c
@@ -310,4 +335,20 @@ func (m *Manager) isSelf(login core.LoginRef, e164 string) bool {
 	}
 	own := m.cfg.LoginNumber(login)
 	return own != "" && own == e164
+}
+
+// notificationSticky returns the sticky duration of an owner notification, 0 when it is not sticky. The
+// duration comes from the event (sticky or unsigned TTL); a notification that only carries the sticky
+// key counts as sticky with the minimum duration (appservice pushes may omit the sticky fields).
+func notificationSticky(evt matrixrtc.Event) time.Duration {
+	if d := max(evt.StickyDuration, evt.StickyRemaining); d > 0 {
+		return d
+	}
+	var c struct {
+		Key *string `json:"msc4354_sticky_key"`
+	}
+	if json.Unmarshal(evt.Content, &c) == nil && c.Key != nil {
+		return matrixrtc.NotificationStickyMin
+	}
+	return 0
 }

@@ -84,7 +84,8 @@ func TestCopyKeysNested(t *testing.T) {
 	}
 	userYAML := "calls:\n    enabled: true\n    external_ip: 203.0.113.9\n    sip_port_min: 5070\n    sip_port_max: 5079\n" +
 		"    rtp_timeout_seconds: 90\n    default_country_code: \"44\"\n    dial_allowed_prefixes: []\n" +
-		"    allow_self_dial: true\n    dtmf_redact_command: false\n    livekit_service_url: https://lk.example.com/jwt\n"
+		"    allow_self_dial: true\n    dtmf_redact_command: false\n    livekit_service_url: https://lk.example.com/jwt\n" +
+		"    matrixrtc_format: dual\n    livekit_auth: sfu_get\n"
 	out, err := configupgrade.DoBytes([]byte(userYAML), &configupgrade.StructUpgrader{
 		SimpleUpgrader: configupgrade.SimpleUpgrader(func(h configupgrade.Helper) {
 			h.Copy(configupgrade.Bool, "calls", "enabled")
@@ -109,6 +110,7 @@ func TestCopyKeysNested(t *testing.T) {
 	want.ExternalIP, want.SIPPortMin, want.SIPPortMax, want.RTPTimeoutSeconds = "203.0.113.9", 5070, 5079, 90
 	want.DefaultCountryCode, want.DialAllowedPrefixes, want.AllowSelfDial, want.DTMFRedactCommand = "44", []string{}, true, &no
 	want.LiveKitServiceURL = "https://lk.example.com/jwt"
+	want.MatrixRTCFormat, want.LiveKitAuth = "dual", "sfu_get"
 	want.Widget.Secret = doc.Calls.Config.Widget.Secret // generated on upgrade
 	if len(want.Widget.Secret) != 64 {
 		t.Fatalf("nested widget secret not generated: %q", want.Widget.Secret)

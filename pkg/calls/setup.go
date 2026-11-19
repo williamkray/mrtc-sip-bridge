@@ -9,6 +9,7 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/williamkray/mrtc-sip-bridge/pkg/core"
 	"github.com/williamkray/mrtc-sip-bridge/pkg/matrixrtc"
@@ -152,6 +153,11 @@ func (c *call) setup() bool {
 		return c.failOnStop()
 	}
 	if err := c.publishMembership(ctx); err != nil {
+		if errors.Is(err, errSlotEncrypted) {
+			c.reject(480, "Temporarily Unavailable")
+			c.fail(failSpec{outcome: outcomeRejected, reason: reasonRejected, notice: noticeEncrypted})
+			return false
+		}
 		c.logFor(ctx).Warn().Str("error", scrubErr(err)).Msg("Failed to publish the ghost call membership")
 		c.fail(failSpec{outcome: outcomeFailed, reason: reasonError, notice: noticeNoAudio})
 		return false
@@ -275,18 +281,75 @@ func (c *call) memberStateKey() string {
 }
 
 func (c *call) joinContent() map[string]any {
-	return matrixrtc.JoinContent(matrixrtc.JoinParams{
+	p := matrixrtc.JoinParams{
 		UserID:     c.room.Ghost.UserID(),
 		DeviceID:   c.deviceID,
 		RoomID:     c.room.RoomID,
 		ServiceURL: c.serviceURL,
 		CreatedTS:  c.memberCreated,
 		Expires:    c.memberExpires,
-	})
+	}
+	if c.plan.sticky && c.plan.auth == rtc.AuthMSC4195 && c.plan.url != "" {
+		// Dual with MSC4195: both memberships name the same hashed identity (membershipID = member.id).
+		p.MemberID, p.LiveKitURL = c.memberID, c.plan.url
+	}
+	return matrixrtc.JoinContent(p)
 }
 
-// publishMembership sends the ghost's call.member (matrixrtc.membership.publish).
+// publishMembership publishes the ghost's membership as planned (format.go): slots, the sticky
+// rtc.member (matrixrtc.member.publish) and the legacy call.member (matrixrtc.membership.publish). A
+// failing sticky part degrades to legacy when the plan has it. errSlotEncrypted means the room's slot
+// declares encryption (the caller refuses the call like an encrypted room); under auto, a
+// bridge-initiated call drops the sticky part instead and rings on the legacy path.
 func (c *call) publishMembership(ctx context.Context) error {
+	if c.ownerMem.Key != "" {
+		c.learnOwnerIdentities(c.ownerMem)
+	}
+	c.choosePlan(ctx)
+	if c.plan.sticky {
+		c.memberID = matrixrtc.NewMemberID()
+		g, _ := c.rtcGhost() // sticky plans only exist for ghosts with the capability
+		err := c.ensureSlots(ctx, g)
+		switch {
+		case errors.Is(err, errSlotEncrypted) && (c.plan.mirror || !c.plan.legacy || c.cfg.MembershipFormat != fmtAuto):
+			// The owner's client (or an explicit sticky/dual config) wants this slot: an encrypted slot
+			// would give silent audio, so refuse like an encrypted room.
+			return err
+		case errors.Is(err, errSlotEncrypted):
+			// Bridge-initiated under auto: the sticky part is optional; ring on the legacy path as before.
+			c.dropSticky(downgradeSlot)
+		case err != nil && c.plan.mirror:
+			// Owner-initiated: the owner's client normally opened the slot, so a read or open problem
+			// is not worth failing the call. Already logged and recorded by ensureSlots.
+			c.setupSpan.SetAttributes(obs.AttrMatrixRTCPlanDowngrade.String(downgradeSlot))
+		case err != nil:
+			if !c.plan.legacy {
+				return err
+			}
+			c.dropSticky(downgradeSlot)
+		}
+		if c.plan.sticky {
+			if err := c.publishSticky(ctx, g); err != nil {
+				if !c.plan.legacy && !c.plan.mirror {
+					return err // explicit sticky-only config: nothing to fall back to
+				}
+				reason := downgradeError
+				if errors.Is(err, errStickyUnsupported) {
+					reason = downgradeUnsupported
+				}
+				c.dropSticky(reason)
+				c.plan.legacy = true // a mirror plan had no legacy part: publish it now
+			}
+		}
+	}
+	if c.plan.legacy {
+		return c.publishLegacy(ctx)
+	}
+	return nil
+}
+
+// publishLegacy sends the ghost's call.member (matrixrtc.membership.publish).
+func (c *call) publishLegacy(ctx context.Context) error {
 	c.memberCreated = c.now()
 	c.memberExpires = matrixrtc.DefaultMembershipExpiry
 	sctx, span := c.child(ctx, "matrixrtc.membership.publish", trace.SpanKindClient,
@@ -308,26 +371,50 @@ func (c *call) publishMembership(ctx context.Context) error {
 	return nil
 }
 
-// sendRing sends the MSC4075 ring (matrixrtc.ring.send).
+// sendRing sends the MSC4075 ring (matrixrtc.ring.send). With a sticky plan the ring is the union shape
+// (slot_id, sticky key, no m.relates_to without a legacy membership) and sent sticky.
 func (c *call) sendRing(ctx context.Context) error {
 	sctx, span := c.child(ctx, "matrixrtc.ring.send", trace.SpanKindClient,
 		obs.AttrCallID.String(c.id),
 		obs.AttrMatrixRoomID.String(c.room.RoomID.String()),
 		obs.AttrRingLifetimeMS.Int64(c.cfg.RingTimeout.Milliseconds()))
-	content := matrixrtc.RingContent(matrixrtc.RingParams{
-		Owner:             c.owner,
-		MembershipEventID: c.memberEventID,
-		Lifetime:          c.cfg.RingTimeout,
-		SenderTS:          c.now(),
-	})
+	g, hasRTC := c.rtcGhost()
+	sticky := c.plan.sticky && c.plan.ringSticky && hasRTC
+	build := func(sticky bool) map[string]any {
+		return matrixrtc.RingContent(matrixrtc.RingParams{
+			Owner:             c.owner,
+			MembershipEventID: c.memberEventID,
+			Lifetime:          c.cfg.RingTimeout,
+			SenderTS:          c.now(),
+			SlotID:            c.ringSlot(),
+			Sticky:            sticky,
+		})
+	}
+	if sticky {
+		span.SetAttributes(obs.AttrMatrixRTCSlotID.String(matrixrtc.SlotIDLabel(c.ringSlot())))
+	}
 	octx, cancel := context.WithTimeout(sctx, matrixOpTimeout)
-	evID, err := c.room.Ghost.SendMessage(octx, c.room.RoomID, matrixrtc.RTCNotification, content)
+	var evID id.EventID
+	var err error
+	if sticky {
+		evID, err = g.SendSticky(octx, c.room.RoomID, matrixrtc.RTCNotification, build(true),
+			matrixrtc.NotificationStickyDuration(c.cfg.RingTimeout))
+		if errors.Is(err, core.ErrUnsupported) {
+			c.m.noteStickyUnsupported(c.login)
+			c.logFor(sctx).Warn().Msg("Sticky ring refused by the homeserver, sending a plain ring")
+			sticky = false
+			evID, err = c.room.Ghost.SendMessage(octx, c.room.RoomID, matrixrtc.RTCNotification, build(false))
+		}
+	} else {
+		evID, err = c.room.Ghost.SendMessage(octx, c.room.RoomID, matrixrtc.RTCNotification, build(false))
+	}
 	cancel()
 	if err != nil {
 		obs.Fail(span, err)
 		c.endSpan(span)
 		return err
 	}
+	c.ringSticky = sticky
 	c.ringEventID = evID
 	c.ringSentAt = c.now()
 	span.SetAttributes(obs.AttrMatrixEventID.String(evID.String()))
@@ -369,6 +456,10 @@ func (c *call) startJoin() {
 		Owner:      c.owner,
 		CallID:     c.id,
 		Attempt:    attempt,
+		Owners:     append([]string(nil), c.ownerIDs...),
+	}
+	if c.plan.auth == rtc.AuthMSC4195 {
+		p.Auth, p.SlotID, p.MemberID, p.LiveKitURL = rtc.AuthMSC4195, c.plan.slot, c.memberID, c.plan.url
 	}
 	joiner, results := c.cfg.Joiner, c.joinResults
 	go func() {
@@ -385,7 +476,8 @@ func (c *call) startJoin() {
 				err = ctx.Err()
 			}
 		}
-		// Capacity maxJoinAttempts+1 and at most maxJoinAttempts attempts: never blocks.
+		// Capacity maxJoinAttempts+2: at most maxJoinAttempts attempts plus one free MSC4195 fallback
+		// attempt, so this never blocks.
 		results <- event{session: s, err: err, attempt: attempt}
 	}()
 }
@@ -419,6 +511,9 @@ func (c *call) onJoinResult(ev event) {
 	if ev.err == nil {
 		c.session = ev.session
 		c.sessEvents = ev.session.Events()
+		if len(c.ownerIDs) > 0 {
+			c.session.AddOwnerIdentities(c.ownerIDs...) // learned while the join was in flight
+		}
 		c.logFor(c.setupCtx).Info().Int("attempt", ev.attempt).Str("livekit_room", ev.session.LiveKitRoom()).
 			Str("identity", ev.session.Identity()).Msg("Joined LiveKit")
 		switch c.state {
@@ -430,7 +525,15 @@ func (c *call) onJoinResult(ev event) {
 		return
 	}
 	c.logFor(c.setupCtx).Warn().Int("attempt", ev.attempt).Str("error", scrubErr(ev.err)).Msg("LiveKit join failed")
-	if c.joinAttempt < maxJoinAttempts {
+	if c.plan.auth == rtc.AuthMSC4195 && c.plan.fallback && isTokenError(ev.err) {
+		// The switch to sfu_get is not a retry: it does not consume a join attempt (and happens once,
+		// fallbackToSFUGet clears plan.fallback).
+		c.joinFallbacks++
+		c.fallbackToSFUGet(ev.err)
+		c.startJoin()
+		return
+	}
+	if c.canRetryJoin() {
 		c.startJoin()
 		return
 	}
@@ -569,6 +672,9 @@ func (c *call) activate(ev sipua.CallEvent) {
 
 // scheduleRefresh arms the ghost membership refresh at created_ts + expires - lead (D15).
 func (c *call) scheduleRefresh() {
+	if c.memberEventID == "" {
+		return // no legacy membership (sticky-only plan): the sticky refresh timer covers it
+	}
 	due := c.memberCreated.Add(c.memberExpires - membershipRefreshLead)
 	d := due.Sub(c.now())
 	if d < 0 {

@@ -176,12 +176,14 @@ func TestPhase2InstrumentNames(t *testing.T) {
 	in.RTPJitter.Record(ctx, 0.01)
 	in.MediaConcealed.Add(ctx, 1)
 	in.DTMFSent.Add(ctx, 1, metric.WithAttributes(AttrDTMFMethod.String("rfc4733")))
+	in.DelayedLeaveRestarts.Add(ctx, 1, metric.WithAttributes(AttrOutcome.String("ok")))
 	got := collect(t, rd)
 	for _, n := range []string{
 		"mrtcsip.call.started", "mrtcsip.call.ended", "mrtcsip.call.active", "mrtcsip.call.setup.duration",
 		"mrtcsip.call.ring.duration", "mrtcsip.call.duration", "mrtcsip.rtc.join.duration",
 		"mrtcsip.media.rtp.packets", "mrtcsip.media.rtp.lost", "mrtcsip.media.rtp.late",
 		"mrtcsip.media.rtp.jitter", "mrtcsip.media.concealed", "mrtcsip.dtmf.sent",
+		"mrtcsip.matrixrtc.delayed_leave.restarts",
 	} {
 		if _, ok := got[n]; !ok {
 			t.Errorf("instrument %s missing", n)

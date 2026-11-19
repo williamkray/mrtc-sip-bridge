@@ -20,6 +20,12 @@ func TestKindOf(t *testing.T) {
 		{"notification alias", RTCNotificationAlias, KindRTCNotification},
 		{"decline", RTCDecline, KindRTCDecline},
 		{"decline alias", RTCDeclineAlias, KindRTCDecline},
+		{"member", RTCMember, KindRTCMember},
+		{"member alias", RTCMemberAlias, KindRTCMember},
+		{"slot", RTCSlot, KindRTCSlot},
+		{"slot alias", RTCSlotAlias, KindRTCSlot},
+		{"member wrong class", event.Type{Type: RTCMember.Type, Class: event.StateEventType}, KindUnknown},
+		{"slot wrong class", event.Type{Type: RTCSlot.Type, Class: event.MessageEventType}, KindUnknown},
 		{"call member wrong class", event.Type{Type: CallMember.Type, Class: event.MessageEventType}, KindUnknown},
 		{"room message", event.EventMessage, KindUnknown},
 	}
@@ -106,7 +112,8 @@ func TestFromMatrixEvent(t *testing.T) {
 }
 
 func TestIngestEventTypesOrder(t *testing.T) {
-	want := []event.Type{CallMember, CallMemberAlias, RTCNotification, RTCNotificationAlias, RTCDecline, RTCDeclineAlias}
+	want := []event.Type{CallMember, CallMemberAlias, RTCNotification, RTCNotificationAlias, RTCDecline, RTCDeclineAlias,
+		RTCMember, RTCMemberAlias, RTCSlot, RTCSlotAlias}
 	got := IngestEventTypes()
 	if len(got) != len(want) {
 		t.Fatalf("len = %d", len(got))
@@ -128,5 +135,27 @@ func TestIngestEventTypesOrder(t *testing.T) {
 		if !typ.IsState() {
 			t.Errorf("%s is not a state event type", typ.Type)
 		}
+	}
+}
+
+func TestFromMatrixEventSticky(t *testing.T) {
+	var evt event.Event
+	raw := `{"type":"m.rtc.member","room_id":"!r:s","event_id":"$e","sender":"@u:s","origin_server_ts":1000,` +
+		`"msc4354_sticky":{"duration_ms":7200000},` +
+		`"unsigned":{"msc4354_sticky_duration_ttl_ms":120000,"redacted_because":{"type":"m.room.redaction"}},"content":{"a":1}}`
+	if err := json.Unmarshal([]byte(raw), &evt); err != nil {
+		t.Fatal(err)
+	}
+	evt.Type.Class = event.MessageEventType
+	got, ok := FromMatrixEvent(&evt)
+	if !ok || got.Kind != KindRTCMember {
+		t.Fatalf("got %+v %v", got, ok)
+	}
+	if got.StickyDuration != time.Hour || got.StickyRemaining != 2*time.Minute || !got.Redacted {
+		t.Fatalf("sticky fields = %v %v %v", got.StickyDuration, got.StickyRemaining, got.Redacted)
+	}
+	plain := event.Event{Type: CallMember, StateKey: new(string)}
+	if g, _ := FromMatrixEvent(&plain); g.StickyDuration != 0 || g.StickyRemaining != 0 || g.Redacted {
+		t.Fatalf("plain = %+v", g)
 	}
 }

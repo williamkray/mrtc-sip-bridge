@@ -274,6 +274,15 @@ type fakeSession struct {
 	mu     sync.Mutex
 	leaves int
 	closed bool
+	owners []string
+
+	// Owner matching like rtc.session: remote participants present in the LiveKit room, the owner's
+	// legacy identity prefix and the exact identities accepted so far. matched lists the identities that
+	// were announced (EventOwnerJoined) and whose audio would be subscribed; nothing else is.
+	present []string
+	prefix  string
+	exact   map[string]bool
+	matched []string
 }
 
 func newFakeSession(audio media.RTCLeg) *fakeSession {
@@ -286,7 +295,69 @@ func newFakeSession(audio media.RTCLeg) *fakeSession {
 func (s *fakeSession) Identity() string      { return string(testGhost) + ":DEV" }
 func (s *fakeSession) LiveKitRoom() string   { return "lkroom" }
 func (s *fakeSession) ServerAddress() string { return "livekit.example.org" }
-func (s *fakeSession) Audio() media.RTCLeg   { return s.audio }
+func (s *fakeSession) AddOwnerIdentities(ids ...string) {
+	s.mu.Lock()
+	s.owners = append(s.owners, ids...)
+	for _, i := range ids {
+		if s.exact == nil {
+			s.exact = map[string]bool{}
+		}
+		s.exact[i] = true
+	}
+	s.rescanLocked()
+	s.mu.Unlock()
+}
+
+// setupOwners gives the session the owner matcher inputs of rtc.JoinParams and the participants that
+// are already in the room, and announces those that match.
+func (s *fakeSession) setupOwners(p rtc.JoinParams, present []string) {
+	s.mu.Lock()
+	s.present = present
+	s.prefix = string(p.Owner) + ":"
+	s.exact = map[string]bool{}
+	for _, i := range p.Owners {
+		s.exact[i] = true
+	}
+	s.rescanLocked()
+	s.mu.Unlock()
+}
+
+func (s *fakeSession) rescanLocked() {
+	for _, id := range s.present {
+		if !s.exact[id] && !(s.prefix != ":" && strings.HasPrefix(id, s.prefix)) {
+			continue
+		}
+		already := false
+		for _, m := range s.matched {
+			if m == id {
+				already = true
+			}
+		}
+		if already || s.closed {
+			continue
+		}
+		s.matched = append(s.matched, id)
+		select {
+		case s.ev <- rtc.Event{Kind: rtc.EventOwnerJoined, Identity: id}:
+		default:
+		}
+	}
+}
+
+// matchedOwners returns the identities announced as owner so far.
+func (s *fakeSession) matchedOwners() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.matched...)
+}
+
+// ownerIdentities returns every identity passed to AddOwnerIdentities, in order.
+func (s *fakeSession) ownerIdentities() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.owners...)
+}
+func (s *fakeSession) Audio() media.RTCLeg { return s.audio }
 func (s *fakeSession) Events() <-chan rtc.Event {
 	return s.ev
 }
@@ -328,6 +399,8 @@ type fakeJoiner struct {
 	audio media.RTCLeg // nil = fakeRTCLeg per session
 	ops   *opLog
 
+	present []string // remote LiveKit participants already in the room (fakeSession owner matching)
+
 	mu       sync.Mutex
 	steps    []joinStep
 	calls    []rtc.JoinParams
@@ -365,6 +438,9 @@ func (j *fakeJoiner) Join(ctx context.Context, p rtc.JoinParams) (rtc.Session, e
 		return nil, step.err
 	}
 	s := newFakeSession(j.audio)
+	if len(j.present) > 0 {
+		s.setupOwners(p, j.present)
+	}
 	j.mu.Lock()
 	j.sessions = append(j.sessions, s)
 	j.mu.Unlock()
@@ -502,6 +578,18 @@ type fakeHost struct {
 	reads       []id.EventID
 	readHook    func() // called inside MarkReadAsOwner
 	noticeGate  chan struct{}
+
+	// ghostOverride, when set, is the ghost of every call room (e.g. a *fakeRTCGhost).
+	ghostOverride core.GhostIntent
+}
+
+func (h *fakeHost) ghostIntent() core.GhostIntent {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.ghostOverride != nil {
+		return h.ghostOverride
+	}
+	return h.ghost
 }
 
 func (h *fakeHost) ResolveCallRoom(_ context.Context, _ core.LoginRef, e164 string) (*core.CallRoom, error) {
@@ -518,7 +606,7 @@ func (h *fakeHost) ResolveCallRoom(_ context.Context, _ core.LoginRef, e164 stri
 	h.mu.Lock()
 	created := h.created
 	h.mu.Unlock()
-	return &core.CallRoom{RoomID: testRoom, RemoteE164: e164, Ghost: h.ghost, Encrypted: enc, Created: created}, nil
+	return &core.CallRoom{RoomID: testRoom, RemoteE164: e164, Ghost: h.ghostIntent(), Encrypted: enc, Created: created}, nil
 }
 
 // LookupCallRoom knows testRoom and testRoom2 (same ghost); anything else is not a call room.
@@ -540,7 +628,7 @@ func (h *fakeHost) LookupCallRoom(_ context.Context, _ core.LoginRef, roomID id.
 	if remote == "" {
 		remote = "+15552345678"
 	}
-	return &core.CallRoom{RoomID: roomID, RemoteE164: remote, Ghost: h.ghost, Encrypted: enc}, nil
+	return &core.CallRoom{RoomID: roomID, RemoteE164: remote, Ghost: h.ghostIntent(), Encrypted: enc}, nil
 }
 
 func (h *fakeHost) lookupList() []id.RoomID {
@@ -1279,4 +1367,204 @@ func (h *harness) outAttr(key string) string {
 		h.t.Fatal("no call.outbound span")
 	}
 	return obstest.Attr(s, key).Emit()
+}
+
+// ---- MatrixRTC 2.0 ghost ----
+
+// stickyCall is one SendSticky call of a fakeRTCGhost.
+type stickyCall struct {
+	typ     mevent.Type
+	content map[string]any
+	d       time.Duration
+}
+
+// delayedCall is one ScheduleDelayed call.
+type delayedCall struct {
+	typ        mevent.Type
+	content    map[string]any
+	delay, dur time.Duration
+	id         core.DelayedEventID
+}
+
+// updateCall is one UpdateDelayed call.
+type updateCall struct {
+	id     core.DelayedEventID
+	action string
+}
+
+// fakeRTCGhost is a fakeGhost with the optional core.GhostRTCIntent capability. It records every call in
+// order in the shared opLog ("slot:open:<id>", "delayed", "sticky:join", "sticky:leave", "sticky:ring",
+// "sticky:withdraw", "sticky:decline", "delayed:restart", "delayed:send", "delayed:cancel") and has
+// injectable errors.
+type fakeRTCGhost struct {
+	*fakeGhost
+
+	rmu     sync.Mutex
+	caps    map[string]bool
+	stickys []stickyCall
+	delays  []delayedCall
+	updates []updateCall
+	slots   map[string]map[string]any // preset slot state by slot id (every slot type)
+	typed   map[string]map[string]any // slot state by type|id: set by SendState, wins over slots
+	opened  []string                  // slot ids opened via SendState (type|id)
+	reads   []string
+
+	// Injectable errors (called under no lock; n = 0-based call index of that kind).
+	stickyErr   func(n int, c stickyCall) error
+	delayErr    func(n int) error
+	updateErr   func(n int, c updateCall) error
+	stateErr    error
+	slotOpenErr error
+}
+
+// newFakeRTCGhost returns a ghost advertising sticky and delayed events.
+func newFakeRTCGhost(g *fakeGhost) *fakeRTCGhost {
+	return &fakeRTCGhost{fakeGhost: g, caps: map[string]bool{matrixrtc.FeatureSticky: true, matrixrtc.FeatureDelayed: true},
+		slots: map[string]map[string]any{}, typed: map[string]map[string]any{}}
+}
+
+func (g *fakeRTCGhost) SendState(ctx context.Context, room id.RoomID, typ mevent.Type, key string, content map[string]any) (id.EventID, error) {
+	if matrixrtc.IsSlotType(typ) {
+		g.rmu.Lock()
+		defer g.rmu.Unlock()
+		if g.slotOpenErr != nil {
+			return "", g.slotOpenErr
+		}
+		g.opened = append(g.opened, typ.Type+"|"+key)
+		g.typed[typ.Type+"|"+key] = content
+		g.ops.add("slot:open:" + key)
+		return id.EventID("$slot" + key), nil
+	}
+	return g.fakeGhost.SendState(ctx, room, typ, key, content)
+}
+
+func (g *fakeRTCGhost) SendSticky(_ context.Context, _ id.RoomID, typ mevent.Type, content map[string]any, d time.Duration) (id.EventID, error) {
+	c := stickyCall{typ, content, d}
+	g.rmu.Lock()
+	n := len(g.stickys)
+	g.stickys = append(g.stickys, c)
+	hook := g.stickyErr
+	g.rmu.Unlock()
+	kind := "sticky:join"
+	switch {
+	case typ == matrixrtc.RTCNotification:
+		kind = "sticky:ring"
+		if _, ok := content[matrixrtc.FieldNotificationType]; !ok {
+			kind = "sticky:withdraw"
+		}
+	case typ == matrixrtc.RTCDecline:
+		kind = "sticky:decline"
+	default:
+		if m, _ := content[matrixrtc.FieldMember].(map[string]any); m != nil && m[matrixrtc.FieldMembership] == matrixrtc.MembershipLeave {
+			kind = "sticky:leave"
+		}
+	}
+	g.ops.add(kind)
+	if hook != nil {
+		if err := hook(n, c); err != nil {
+			return "", err
+		}
+	}
+	return id.EventID("$sticky" + strconv.Itoa(n+1)), nil
+}
+
+func (g *fakeRTCGhost) ScheduleDelayed(_ context.Context, _ id.RoomID, typ mevent.Type, content map[string]any, delay, sticky time.Duration) (core.DelayedEventID, error) {
+	g.rmu.Lock()
+	n := len(g.delays)
+	did := core.DelayedEventID("delay" + strconv.Itoa(n+1))
+	g.delays = append(g.delays, delayedCall{typ, content, delay, sticky, did})
+	hook := g.delayErr
+	g.rmu.Unlock()
+	g.ops.add("delayed")
+	if hook != nil {
+		if err := hook(n); err != nil {
+			return "", err
+		}
+	}
+	return did, nil
+}
+
+func (g *fakeRTCGhost) UpdateDelayed(_ context.Context, did core.DelayedEventID, action string) error {
+	c := updateCall{did, action}
+	g.rmu.Lock()
+	n := len(g.updates)
+	g.updates = append(g.updates, c)
+	hook := g.updateErr
+	g.rmu.Unlock()
+	if action != "restart" {
+		g.ops.add("delayed:" + action)
+	}
+	if hook != nil {
+		return hook(n, c)
+	}
+	return nil
+}
+
+func (g *fakeRTCGhost) StateEvent(_ context.Context, _ id.RoomID, typ mevent.Type, key string) (map[string]any, error) {
+	g.rmu.Lock()
+	defer g.rmu.Unlock()
+	g.reads = append(g.reads, typ.Type+"|"+key)
+	if g.stateErr != nil {
+		return nil, g.stateErr
+	}
+	if c, ok := g.typed[typ.Type+"|"+key]; ok {
+		return c, nil
+	}
+	return g.slots[key], nil
+}
+
+func (g *fakeRTCGhost) RTCTransports(context.Context) ([]byte, error) {
+	return nil, core.ErrUnsupported
+}
+
+func (g *fakeRTCGhost) LiveKitToken(context.Context, core.LiveKitTokenRequest) (string, error) {
+	return "", core.ErrUnsupported
+}
+
+func (g *fakeRTCGhost) Capabilities(context.Context) map[string]bool {
+	g.rmu.Lock()
+	defer g.rmu.Unlock()
+	out := make(map[string]bool, len(g.caps))
+	for k, v := range g.caps {
+		out[k] = v
+	}
+	return out
+}
+
+func (g *fakeRTCGhost) stickyList() []stickyCall {
+	g.rmu.Lock()
+	defer g.rmu.Unlock()
+	return append([]stickyCall(nil), g.stickys...)
+}
+
+func (g *fakeRTCGhost) delayList() []delayedCall {
+	g.rmu.Lock()
+	defer g.rmu.Unlock()
+	return append([]delayedCall(nil), g.delays...)
+}
+
+func (g *fakeRTCGhost) updateList() []updateCall {
+	g.rmu.Lock()
+	defer g.rmu.Unlock()
+	return append([]updateCall(nil), g.updates...)
+}
+
+func (g *fakeRTCGhost) openedList() []string {
+	g.rmu.Lock()
+	defer g.rmu.Unlock()
+	return append([]string(nil), g.opened...)
+}
+
+// withRTCGhost makes every call room's ghost a fakeRTCGhost; the pointer is stored in *out when non-nil.
+func withRTCGhost(out **fakeRTCGhost, mods ...func(*fakeRTCGhost)) harnessOpt {
+	return func(h *harness) {
+		g := newFakeRTCGhost(h.ghost)
+		for _, m := range mods {
+			m(g)
+		}
+		h.host.ghostOverride = g
+		if out != nil {
+			*out = g
+		}
+	}
 }

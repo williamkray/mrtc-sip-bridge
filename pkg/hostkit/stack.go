@@ -46,6 +46,9 @@ func NewCallStack(br *bridgev2.Bridge, cfg *Config, deps CallStackDeps) (*calls.
 		}
 		rlog.Info().Str("host", host).Str("source", resolver.Source()).Msg("LiveKit service URL")
 	}()
+	// The transports resolver caches /rtc/transports for the whole bridge (1 h, failures 60 s); the
+	// ghost capability cache (/versions) is shared by all ghosts in ghostintent_rtc.go.
+	transports := rtc.NewTransportResolver(clock.Real())
 	mgr := calls.NewManager(calls.Config{
 		Host:               deps.Host,
 		Joiner:             rtc.NewJoiner(rtc.Config{HTTPClient: hc, Log: rlog}),
@@ -61,6 +64,9 @@ func NewCallStack(br *bridgev2.Bridge, cfg *Config, deps CallStackDeps) (*calls.
 		DialAllowedPrefixes: cfg.DialAllowedPrefixes,
 		DialNumberFormat:    cfg.NumberFormat(),
 		AllowSelfDial:       cfg.AllowSelfDial,
+		MembershipFormat:    cfg.MatrixRTCFormat,
+		LiveKitAuth:         cfg.LiveKitAuth,
+		Transports:          transports.Get,
 		Log:                 deps.Log, // plain logger: calls adds component=calls itself
 	})
 	return mgr, resolver

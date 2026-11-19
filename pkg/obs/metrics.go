@@ -34,6 +34,9 @@ type Instruments struct {
 	RTPJitter         metric.Float64Histogram   // mrtcsip.media.rtp.jitter    s (SIP leg)
 	MediaConcealed    metric.Int64Counter       // mrtcsip.media.concealed     {frame}
 	DTMFSent          metric.Int64Counter       // mrtcsip.dtmf.sent           {digit}, attribute dtmf.method=rfc4733
+
+	// MatrixRTC 2.0 (docs/MATRIXRTC2-SPEC.md WP5).
+	DelayedLeaveRestarts metric.Int64Counter // mrtcsip.matrixrtc.delayed_leave.restarts {restart}, outcome=ok|gone|error
 }
 
 // M returns the current instrument registry (never nil).
@@ -115,6 +118,9 @@ func newInstruments(mp metric.MeterProvider) *Instruments {
 	handle(err)
 	in.DTMFSent, err = m.Int64Counter("mrtcsip.dtmf.sent",
 		metric.WithUnit("{digit}"), metric.WithDescription("DTMF digits sent to the SIP side (RFC 4733)"))
+	handle(err)
+	in.DelayedLeaveRestarts, err = m.Int64Counter("mrtcsip.matrixrtc.delayed_leave.restarts",
+		metric.WithUnit("{restart}"), metric.WithDescription("MSC4140 delayed leave restarts for ghost sticky memberships"))
 	handle(err)
 	return in
 }

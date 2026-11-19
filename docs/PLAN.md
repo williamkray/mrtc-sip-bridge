@@ -22,6 +22,13 @@ first. Update the checkboxes and the "Current state" section as work lands, so t
 - Widget Contacts tab (unreleased, issue 6 phase 2): optional `hostkit.ContactLister` (`ListContacts`, plus
   `DisplayContactName`), `GET api/v1/contacts` (paged search, per-MXID 5/s, no span), `features.contacts`, and a
   Dial / Contacts tab bar in the room widget and the PWA. Call history is deferred. WIDGET-SPEC §7, §7.5, §9.
+- MatrixRTC 2.0 (unreleased, `docs/MATRIXRTC2-SPEC.md`, ADR-014): the bridge reads sticky `m.rtc.member`
+  and `rtc.slot` events (both type names, both slot spellings) and the ghost can publish the sticky
+  membership with an MSC4140 delayed leave, open the room slot, and get its LiveKit token from the
+  homeserver (MSC4195 `get_token`, falling back to `/sfu/get`). Config `matrixrtc_format` and
+  `livekit_auth` (both default `auto`); optional `core.GhostRTCIntent`, provided by hostkit. Code, tests
+  and docs are done (WP1-WP6); live verification (spec WP0, §9) is pending and happens through the new
+  spans. Host side (WP7) waits for a tag.
 - Next: Phase 4 (robustness).
 
 ## Goal
@@ -258,6 +265,8 @@ Not a blocker, nice-to-have.
 | JMP SIP minute caps (unverified) | Document. Out of our control. |
 | Audio quality / jitter | Simple jitter buffer first. Measure. Fall back per ADR-003. |
 | lk-jwt-service room-name mismatch | Always fetch tokens via the auth service as the ghost. |
+| Sticky/slot/delayed events need experimental Synapse flags; AS masquerade for `get_token` and delayed events is unverified | `auto` falls back to the legacy membership and `/sfu/get`; telemetry shows the path taken (`matrixrtc.plan.*`, `rtc.token.fallback`). |
+| Clients disagree on the sticky dialect (`m.rtc.member`/`m.call#room` vs unstable/`ROOM`) | Read all, write in the owner's dialect; dual for bridge-initiated calls (ADR-014). |
 
 ## Testing strategy
 

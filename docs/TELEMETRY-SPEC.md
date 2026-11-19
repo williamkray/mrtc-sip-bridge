@@ -195,7 +195,7 @@ never sees an `obs`-annotated ctx.
 root-span log annotation of `Start`, exported for hosts with their own tracer), `Scrub` (string scrubber
 of §6.3),
 `WrapHTTPTransport`, `HTTPAttrs`, `Instruments` accessor (`obs.M()` returning the struct of §4.3),
-attribute key constants (`obs.AttrCallID`, ...). Semantics of the span/log helpers are exactly jabber's
+attribute key constants (`obs.AttrCallID`, ..., including the MatrixRTC 2.0 keys of §5.2: `AttrMatrixRTCFormat`, `AttrMatrixRTCSlotID`, `AttrMatrixRTCSlotAction`, `AttrMatrixRTCMemberType`, `AttrMatrixRTCDelayedLeave`, `AttrMatrixRTCLeaveVia`, `AttrMatrixRTCPlan*`, `AttrMatrixRTCStickySupported`, `AttrMatrixRTCDelayedSupported`, `AttrMatrixRTCTransports`, `AttrRTCTokenEndpoint`, `AttrRTCTokenFallback`). `Instruments` gains `DelayedLeaveRestarts` (§4.3). Semantics of the span/log helpers are exactly jabber's
 (`span.go` at `e812e20`), including: `Start` annotates the ctx logger only for new roots or new traces;
 annotation is skipped for disabled loggers and `zerolog.DefaultContextLogger`; only sampled, valid span
 contexts produce log fields.
@@ -243,7 +243,7 @@ dots). Attributes are listed with their closed value sets.
 | `mrtcsip.sip.register.attempts` | Counter | `{attempt}` | `sip.register.kind` (full, refresh, unregister), `outcome` (ok, auth, transient) | every REGISTER transaction result | T6 |
 | `mrtcsip.sip.register.duration` | Histogram | `s` | `sip.register.kind`, `outcome` | per attempt, digest round included. Buckets 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 | T6 |
 | `mrtcsip.sip.registrations` | ObservableGauge | `{registration}` | `state` (registering, registered, auth_failed, transient_error) | count of active UAs per state (reads `UA.State()`) | T6 |
-| `mrtcsip.matrixrtc.events` | Counter | `{event}` | `matrixrtc.kind` (call_member, notification, decline, ...: the `matrixrtc.EventKind` strings), `routed` (true, false) | every ingest handler call | T6 |
+| `mrtcsip.matrixrtc.events` | Counter | `{event}` | `matrixrtc.kind` (call_member, notification, decline, rtc_member, rtc_slot, ...: the `matrixrtc.EventKind` strings), `routed` (true, false) | every ingest handler call | T6 |
 | `mrtcsip.bridge.logins` | Counter | `{login}` | `outcome` (ok, auth_failed, transient_error, timeout, error) | login submit result | T6 |
 | `mrtcsip.call.started` | Counter | `{call}` | `call.direction` (inbound, outbound) | INVITE received / outbound call accepted for dialing | 2/3 |
 | `mrtcsip.call.ended` | Counter | `{call}` | `call.direction`, `call.outcome` (answered, missed, declined, cancelled, timeout, busy, failed, rejected), `sip.response.status_class` (1xx..6xx, none) | call fully torn down | 2/3 |
@@ -252,6 +252,7 @@ dots). Attributes are listed with their closed value sets.
 | `mrtcsip.call.ring.duration` | Histogram | `s` | `call.direction`, `call.outcome` | inbound: ring sent to owner join / decline / cancel / timeout; outbound: first 180/183 to 200 or failure. Same buckets as setup | 2/3 |
 | `mrtcsip.call.duration` | Histogram | `s` | `call.direction`, `media.codec` (PCMU, PCMA, other) | answered calls, answer to hangup. Buckets 10, 30, 60, 120, 300, 600, 1800, 3600, 7200 | 2/3 |
 | `mrtcsip.rtc.join.duration` | Histogram | `s` | `outcome` (ok, openid_error, token_error, connect_error, publish_error, timeout) | OpenID request through track published. Buckets 0.1, 0.25, 0.5, 1, 2, 3, 5, 10 | 2 |
+| `mrtcsip.matrixrtc.delayed_leave.restarts` | Counter | `{restart}` | `outcome` (ok, gone, error) | each restart of a ghost's MSC4140 delayed leave (every 7 s per sticky call). Metric only, never a span (like REGISTER refresh). `gone` = the delayed event no longer exists (404 `M_NOT_FOUND`); other failures, including 429, are `error`. `member.id` is never an attribute | MatrixRTC 2.0 |
 | `mrtcsip.media.rtp.packets` | Counter | `{packet}` | `media.direction` (rx, tx) | ticker flush; the `mrtcsip.media.rtp.*` instruments count the **SIP** RTP leg | 2 |
 | `mrtcsip.media.rtp.lost` | Counter | `{packet}` | (none) | rx sequence gaps not later filled, ticker flush | 2 |
 | `mrtcsip.media.rtp.late` | Counter | `{packet}` | (none) | rx packets discarded by the jitter buffer | 2 |
@@ -318,7 +319,20 @@ by deployment, not by user, so allowed. `url.template` is bounded by the templat
 | `sip.auth.challenged` | true | digest round happened; never the challenge or response |
 | `network.transport`, `network.peer.address`, `network.peer.port`, `server.address`, `server.port` | udp | OTel semconv |
 | `matrix.room_id`, `matrix.event_id`, `matrix.event.type`, `matrix.sender`, `matrix.ghost_id`, `matrix.owner_id` | | MXIDs allowed |
-| `matrixrtc.kind`, `matrixrtc.membership.device_id`, `matrixrtc.membership.expires_ms` | call_member | |
+| `matrixrtc.kind`, `matrixrtc.membership.device_id`, `matrixrtc.membership.expires_ms` | call_member, notification, decline, rtc_member, rtc_slot | |
+| `matrixrtc.membership.format` | legacy, sticky | `matrixrtc.ingest` (member kinds), `matrixrtc.member.publish`, `matrixrtc.member.leave`, `call.membership.refresh` |
+| `matrixrtc.slot_id` | `m.call#room`, `m.call#ROOM`, `other` | spans only, never metrics. Closed set: the two room spellings, any other slot id (sender-controlled on ingest) is recorded as `other` (`matrixrtc.SlotIDLabel`); `matrixrtc.ingest` of slot and member kinds, slot/member/ring spans |
+| `matrixrtc.slot.action` | noop, opened, refused_encrypted, failed | `matrixrtc.slot.open` |
+| `matrixrtc.member.event_type` | `m.rtc.member`, `org.matrix.msc4143.rtc.member` | the sticky event type sent (the dialect) |
+| `matrixrtc.delayed_leave` | true | bool: a delayed leave is scheduled (`matrixrtc.member.publish`) |
+| `matrixrtc.member.leave_via` | delayed_send, explicit | `matrixrtc.member.leave` |
+| `matrixrtc.plan.format` | legacy, sticky, dual | `matrixrtc.plan.choose`, setup span |
+| `matrixrtc.plan.reason` | config_legacy, no_rtc_intent, no_sticky_support, sticky_unsupported_recently, owner_legacy, owner_sticky_mirror, bridge_dialect, bridge_stable, config_sticky, config_dual, msc4195_failed_recently | the row of MATRIXRTC2-SPEC §2 that decided. `bridge_stable` (auto, bridge-initiated, no dialect yet) means: legacy ring shape, `sfu_get`, sticky membership with a `livekit_service_url` transport. `msc4195_failed_recently`: `auto` would use MSC4195 but a `get_token` attempt of this login failed before the LiveKit connect within 10 min, so the call goes straight to `sfu_get` (new value) |
+| `matrixrtc.plan.downgrade` | slot_error, sticky_unsupported, sticky_error | setup span: a dual plan fell back to legacy only; an owner-mirror plan never fails the call: a slot problem is `slot_error` (sticky still published), a sticky failure is `sticky_unsupported` / `sticky_error` and the call goes on with the legacy membership |
+| `matrixrtc.sticky.supported`, `matrixrtc.delayed.supported` | true | bool: homeserver capabilities (`/versions`, cached 10 min); sticky is false while a refused send pauses sticky for the login (10 min) |
+| `matrixrtc.transports.status` | not_needed, ok, no_livekit_url, error | `/rtc/transports` lookup of the plan |
+| `rtc.token.endpoint` | sfu_get, get_token_cs | `rtc.jwt_fetch` and `matrixrtc.plan.choose` |
+| `rtc.token.fallback` | true | bool: MSC4195 `get_token` failed (stage `token_error`, or a `timeout` before the LiveKit connect) and `sfu_get` was used (setup span, re-publish spans). The switch does not consume a join attempt, and the login skips MSC4195 for 10 min afterwards (`matrixrtc.plan.reason=msc4195_failed_recently`). The `get_token` call itself is bounded to 4 s (stable plus unstable path) |
 | `livekit.room` | hashed room name returned by lk-jwt-service | not secret |
 | `livekit.participant.identity`, `livekit.server.address` | | |
 | `media.codec`, `media.ptime_ms`, `media.telephone_event` | PCMU, 20, true | from SDP, not the SDP |
@@ -451,6 +465,33 @@ cmd.call (CONSUMER, root) or matrixrtc.ingest (owner_membership trigger)
 `call.outbound` is a linked root because the command handler (or the appservice event path) returns long
 before the call is set up. Attributes as inbound, with `call.trigger` (command, owner_membership). Details:
 PHASE3-SPEC §10.
+
+#### MatrixRTC 2.0 spans (MATRIXRTC2-SPEC §3 WP5)
+
+All are child-only: they appear under the setup or teardown span of a call and never start a root. The
+plan is decided once per call, in `publishMembership` (before the ring and the join), so these spans sit
+beside `matrixrtc.membership.publish`.
+
+| Span | Kind | Notes |
+|---|---|---|
+| `matrixrtc.plan.choose` | INTERNAL | Not created when the ghost has no `core.GhostRTCIntent` (legacy, nothing to observe). Attributes: `call.id`, `matrixrtc.plan.format`, `matrixrtc.plan.reason`, `matrixrtc.sticky.supported`, `matrixrtc.delayed.supported`, `matrixrtc.transports.status`, `rtc.token.endpoint`; for sticky plans also `matrixrtc.slot_id`, `matrixrtc.member.event_type`. `matrixrtc.plan.format` and `.reason` are repeated on the setup span. Its children are the cached `/versions` and `/rtc/transports` requests (CLIENT, transport wrapping). |
+| `matrixrtc.slot.open` | CLIENT | One per (slot event type, slot id) pair the plan needs (bridge-initiated: both spellings under both `m.rtc.slot` and `org.matrix.msc4143.rtc.slot` = 4; owner-initiated mirror: the owner's type and spelling = 1). Every pair is read first; nothing is opened if any existing slot declares encryption. Attributes: `call.id`, `matrixrtc.slot_id`, `matrixrtc.slot.action` (noop, opened, refused_encrypted, failed). A slot with `encryption` is never rewritten and refuses the call (Warn log, same path as an encrypted room). Slots are never closed. |
+| `matrixrtc.member.publish` | CLIENT | Sticky join: delayed leave scheduled first (when `FeatureDelayed`), then the sticky send. Attributes: `call.id`, `matrix.room_id`, `matrixrtc.membership.format=sticky`, `matrixrtc.slot_id`, `matrixrtc.member.event_type`, `matrixrtc.delayed_leave`, `matrix.event_id`. Also emitted when a token fallback re-publishes the join (with `rtc.token.fallback=true`). |
+| `matrixrtc.member.leave` | CLIENT | Teardown: keeper stopped, then the delayed leave is fired (`delayed_send`) or the leave is sent explicitly. Attributes: `call.id`, `matrixrtc.membership.format=sticky`, `matrixrtc.slot_id`, `matrixrtc.member.event_type`, `matrixrtc.member.leave_via`. |
+| `matrixrtc.ring.withdraw` | CLIENT | Ends a sticky ring (the sticky key with no other fields). `call.id`, `matrixrtc.slot_id`. `matrixrtc.ring.redact` still runs. |
+
+Other changes: `matrixrtc.ring.send` carries `matrixrtc.slot_id` for a sticky ring. `rtc.jwt_fetch` gets
+`rtc.token.endpoint` (`sfu_get` or `get_token_cs`); with `get_token_cs` there is no `rtc.openid_token`
+span. A token fallback sets `rtc.token.fallback=true` on the setup span. A dual plan that dropped to
+legacy sets `matrixrtc.plan.downgrade` on the setup span. `call.membership.refresh` (linked root) also
+covers the 40 min sticky re-send, with `matrixrtc.membership.format=sticky`. `matrixrtc.ingest` adds
+`matrixrtc.membership.format` (member kinds) and `matrixrtc.slot_id` (member and slot kinds).
+
+The delayed-leave keeper (one goroutine per sticky call) starts no span. It only counts
+`mrtcsip.matrixrtc.delayed_leave.restarts` and logs state changes; its log lines carry the trace fields of
+the call's setup span (`obs.LoggerSC` with the stored span context). `matrixrtc.member.leave` is not
+created when the ghost has no `GhostRTCIntent`. The `member.id` is a random pseudonym,
+not a credential: debug logs may carry it, metrics never do.
 
 ### 5.8 (f) Bot commands
 

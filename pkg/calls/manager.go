@@ -46,6 +46,16 @@ type Config struct {
 	DialNumberFormat sipua.NumberFormat
 	// AllowSelfDial permits dialling the login's own number.
 	AllowSelfDial bool
+
+	// MembershipFormat selects the ghost's membership format: "auto" (default: mirror the owner's
+	// dialect, see format.go), "legacy", "sticky" or "dual". Anything else is treated as "auto".
+	MembershipFormat string
+	// LiveKitAuth selects how the ghost gets its LiveKit token: "auto" (default: MSC4195 get_token
+	// first, sfu_get on a token error), "sfu_get" or "msc4195". Anything else is treated as "auto".
+	LiveKitAuth string
+	// Transports returns the homeserver's MSC4143 transports (e.g. (*rtc.TransportResolver).Get); nil =
+	// none known, so MSC4195 is only used for owner-mirrored calls.
+	Transports func(ctx context.Context, g core.GhostRTCIntent) ([]matrixrtc.Transport, error)
 }
 
 // PlaceCallRequest is a command-initiated outbound call. Exactly one of Number and RoomID is set.
@@ -85,6 +95,11 @@ type Manager struct {
 	ownerLive    map[core.LoginRef]map[id.RoomID]map[string]memberSeen
 	pendingNotif map[core.LoginRef]map[id.RoomID]notifSeen
 	cooldown     map[id.RoomID]time.Time // no owner trigger in this room before the time
+
+	dialect map[core.LoginRef]Dialect // owner client dialect per login (dialect.go)
+
+	stickyOff map[core.LoginRef]time.Time // sticky sends refused (ErrUnsupported) until the time (format.go)
+	tokenOff  map[core.LoginRef]time.Time // MSC4195 get_token failed until the time (format.go)
 }
 
 var _ core.RTCEventSink = (*Manager)(nil)
@@ -109,6 +124,7 @@ func NewManager(cfg Config) *Manager {
 	if cfg.DialTimeout <= 0 {
 		cfg.DialTimeout = defaultDialTimeout
 	}
+	cfg.MembershipFormat, cfg.LiveKitAuth = normalizeFormat(cfg.MembershipFormat), normalizeAuth(cfg.LiveKitAuth)
 	m := &Manager{
 		cfg:          cfg,
 		log:          cfg.Log.With().Str("component", "calls").Logger(),
@@ -119,6 +135,9 @@ func NewManager(cfg Config) *Manager {
 		ownerLive:    make(map[core.LoginRef]map[id.RoomID]map[string]memberSeen),
 		pendingNotif: make(map[core.LoginRef]map[id.RoomID]notifSeen),
 		cooldown:     make(map[id.RoomID]time.Time),
+		dialect:      make(map[core.LoginRef]Dialect),
+		stickyOff:    make(map[core.LoginRef]time.Time),
+		tokenOff:     make(map[core.LoginRef]time.Time),
 	}
 	switch cfg.OutboundTrigger {
 	case "", modeRing:
@@ -160,11 +179,17 @@ func (m *Manager) HandleInvite(login core.LoginRef, localE164 string, sc sipua.I
 func (m *Manager) HandleRTCEvent(ctx context.Context, login core.LoginRef, evt matrixrtc.Event) {
 	var kind eventKind
 	switch evt.Kind {
-	case matrixrtc.KindCallMember:
+	case matrixrtc.KindCallMember, matrixrtc.KindRTCMember:
 		kind = evOwnerMembership
+	case matrixrtc.KindRTCSlot:
+		return // slot state is never routed and never a trigger (the ghost reads slots itself)
 	case matrixrtc.KindRTCDecline:
 		kind = evDecline
 	case matrixrtc.KindRTCNotification:
+		if n, ok := matrixrtc.ParseNotification(evt); ok && n.Withdrawn {
+			m.withdrawNotif(login, evt)
+			return
+		}
 	default:
 		return
 	}

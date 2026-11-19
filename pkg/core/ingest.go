@@ -136,6 +136,9 @@ func (in *Ingest) ingest(ctx context.Context, login LoginRef, routed bool, evt *
 			),
 		}
 	}
+	if obs.Enabled() {
+		opts = append(opts, trace.WithAttributes(memberAttrs(parsed, t0)...))
+	}
 	sctx, span := obs.Start(ctx, "matrixrtc.ingest", opts...)
 	defer span.End()
 	in.mu.RLock()
@@ -144,4 +147,36 @@ func (in *Ingest) ingest(ctx context.Context, login LoginRef, routed bool, evt *
 	span.SetAttributes(attribute.String("matrixrtc.routed_to", "none")) // default; the sink may overwrite it
 	sink.HandleRTCEvent(sctx, login, parsed)
 	return true
+}
+
+// memberAttrs returns the MatrixRTC 2.0 span attributes of a member or slot event: the membership format
+// (legacy|sticky), the slot id as received and the device id of the parsed membership. Attributes are
+// only added when the event parses and the value is known; never any content.
+func memberAttrs(evt matrixrtc.Event, now time.Time) []attribute.KeyValue {
+	switch evt.Kind {
+	case matrixrtc.KindCallMember, matrixrtc.KindRTCMember:
+		m, ok := matrixrtc.ParseMembership(evt, now)
+		if !ok {
+			return nil
+		}
+		var attrs []attribute.KeyValue
+		switch m.Format {
+		case matrixrtc.FormatLegacy:
+			attrs = append(attrs, obs.AttrMatrixRTCFormat.String("legacy"))
+		case matrixrtc.FormatSticky:
+			attrs = append(attrs, obs.AttrMatrixRTCFormat.String("sticky"))
+		}
+		if m.SlotID != "" {
+			attrs = append(attrs, obs.AttrMatrixRTCSlotID.String(matrixrtc.SlotIDLabel(m.SlotID)))
+		}
+		if m.DeviceID != "" {
+			attrs = append(attrs, obs.AttrMatrixRTCDeviceID.String(m.DeviceID))
+		}
+		return attrs
+	case matrixrtc.KindRTCSlot:
+		if evt.StateKey != "" {
+			return []attribute.KeyValue{obs.AttrMatrixRTCSlotID.String(matrixrtc.SlotIDLabel(evt.StateKey))}
+		}
+	}
+	return nil
 }

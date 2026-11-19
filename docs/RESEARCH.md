@@ -67,6 +67,23 @@ Both are old, so re-check everything against a live account.
   current Element Call behaviour (it's AGPL-3.0, so read it but don't copy it, see CREDITS.md).
   Unstable prefixes change.
 
+### MatrixRTC 2.0 (2026-11-19)
+
+Versions and commits checked (MSC4143, MSC4354, MSC4140, MSC4195, MSC4196, matrix-js-sdk, Element Call,
+matrix-rust-rtc, ruma, lk-jwt-service v0.10.0, Synapse v1.165.0, mautrix-go v0.33.0) are listed in
+`docs/MATRIXRTC2-SPEC.md` §0; wire formats are §1. Facts that changed earlier notes:
+
+- Sticky `m.rtc.member` (MSC4354) replaces per-device state events. Type names and room slot spelling
+  differ by client: js-sdk/Element Call `org.matrix.msc4143.rtc.member` + `m.call#ROOM`; matrix-rust-rtc,
+  lk-jwt >= 0.10 and the 2026-11-19 production client (sable-next) `m.rtc.member` + `m.call#room`.
+- lk-jwt-service >= 0.10 hashes `m.call#room` for every endpoint, including `/sfu/get` (v0.9: `ROOM`).
+- LiveKit identity: `/sfu/get` gives `<user>:<device>`; the MSC4195 homeserver `get_token` gives
+  `b64(sha256([user, member.id]))`. The JWT carries no attributes.
+- Synapse reads only the unstable sticky parameter `org.matrix.msc4354.sticky_duration_ms` and the
+  unstable delayed-event paths. mautrix `RTCTransports` reads the wrong key for the stable path.
+- Unverified until WP0 (spec §9): AS masquerade through the MSC4512 proxy, delayed events for AS users,
+  sticky fields in AS pushes.
+
 ## Go libraries
 
 | Purpose | Library | Notes |

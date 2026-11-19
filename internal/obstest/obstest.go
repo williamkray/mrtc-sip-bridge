@@ -258,7 +258,7 @@ var DefaultMetricAllowlist = MetricAllowlist{
 		"state": {"registering", "registered", "auth_failed", "transient_error"},
 	},
 	"mrtcsip.matrixrtc.events": {
-		"matrixrtc.kind": {"call_member", "rtc_notification", "rtc_decline", "unknown"},
+		"matrixrtc.kind": {"call_member", "rtc_notification", "rtc_decline", "rtc_member", "rtc_slot", "unknown"},
 		"routed":         {"true", "false"},
 	},
 	"mrtcsip.bridge.logins": {
@@ -282,6 +282,9 @@ var DefaultMetricAllowlist = MetricAllowlist{
 	"mrtcsip.call.duration": {
 		"call.direction": callDirections,
 		"media.codec":    {"PCMU", "PCMA", "other"},
+	},
+	"mrtcsip.matrixrtc.delayed_leave.restarts": {
+		"outcome": {"ok", "gone", "error"},
 	},
 	"mrtcsip.rtc.join.duration": {
 		"outcome": {"ok", "openid_error", "token_error", "connect_error", "publish_error", "timeout"},

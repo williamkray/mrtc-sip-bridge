@@ -15,6 +15,15 @@ import (
 	"github.com/williamkray/mrtc-sip-bridge/pkg/obs"
 )
 
+// AuthMode selects how the LiveKit JWT is obtained.
+type AuthMode int
+
+// Auth modes. The zero value keeps the original OpenID + lk-jwt-service /sfu/get flow.
+const (
+	AuthSFUGet  AuthMode = iota // OpenID token as the ghost, POST <ServiceURL>/sfu/get (identity "<ghost>:<device>")
+	AuthMSC4195                 // homeserver C-S get_token as the ghost (hashed identity); no OpenID step
+)
+
 // JoinParams describes one ghost join.
 type JoinParams struct {
 	Ghost      core.GhostIntent // OpenID token is requested as this ghost
@@ -24,6 +33,13 @@ type JoinParams struct {
 	Owner      id.UserID // only this user's audio tracks are subscribed
 	CallID     string    // logs and spans only
 	Attempt    int       // 1-based join attempt, rtc.join.attempt span attribute (0 = unset, omitted)
+
+	// MSC4195 (Auth == AuthMSC4195; all unused for AuthSFUGet except Owners).
+	Auth       AuthMode
+	SlotID     string   // canonical slot spelling as received/published
+	MemberID   string   // get_token member_id = the ghost's member.id
+	LiveKitURL string   // transport url: sent to get_token and used as the connect URL
+	Owners     []string // initial accepted owner LiveKit identities (exact); Owner's legacy prefix always applies
 }
 
 // Joiner joins LiveKit rooms. Join blocks until the track is published or fails (bounded by
@@ -41,6 +57,11 @@ type Session interface {
 	// Events delivers owner presence and disconnects. Capacity 32; sends never block (an event that does
 	// not fit is dropped and logged). Closed after Leave returns.
 	Events() <-chan Event
+	// AddOwnerIdentities accepts more exact owner LiveKit identities (e.g. hashed MSC4195 identities learned
+	// from the owner's membership). Thread-safe. It rescans the remote participants, emits EventOwnerJoined
+	// for newly matched ones and subscribes their already-published audio. Audio of unmatched participants
+	// is never subscribed, read or forwarded.
+	AddOwnerIdentities(ids ...string)
 	// Leave disconnects (idempotent). Bounded by ctx.
 	Leave(ctx context.Context) error
 }
@@ -67,6 +88,9 @@ type Event struct {
 type JoinError struct {
 	Stage string // "openid_error", "token_error", "connect_error", "publish_error", "timeout"
 	Err   error
+	// BeforeConnect is true when the join failed before the LiveKit connect was started (OpenID, token
+	// or a cancellation during those steps). With AuthMSC4195 it marks failures a switch to sfu_get can fix.
+	BeforeConnect bool
 }
 
 // Error returns "rtc join: <stage>: <scrubbed err>".
@@ -103,11 +127,16 @@ func SetLibraryLogger(log zerolog.Logger) {
 }
 
 // PathTemplate maps lk-jwt-service and well-known paths to bounded url.template values:
-// suffix "/sfu/get" -> "/sfu/get", "/.well-known/matrix/client" -> itself, anything else -> "*".
+// suffixes "/sfu/get", "/rtc/livekit/get_token" and "/rtc/transports" -> themselves,
+// "/.well-known/matrix/client" -> itself, anything else -> "*".
 func PathTemplate(path string) string {
 	switch {
 	case strings.HasSuffix(path, "/sfu/get"):
 		return "/sfu/get"
+	case strings.HasSuffix(path, "/rtc/livekit/get_token"):
+		return "/rtc/livekit/get_token"
+	case strings.HasSuffix(path, "/rtc/transports"):
+		return "/rtc/transports"
 	case path == "/.well-known/matrix/client":
 		return path
 	default:
@@ -136,7 +165,8 @@ func (r *ServiceURLResolver) Source() string {
 	return r.source()
 }
 
-// LiveKitRoomName mirrors lk-jwt-service's room alias (wire §4.5), for diagnostics only.
+// LiveKitRoomName mirrors lk-jwt-service's room alias for the stable slot "m.call#room" (lk-jwt-service
+// >= 0.10; <= 0.9 hashed "m.call#ROOM"), for diagnostics only.
 func LiveKitRoomName(roomID id.RoomID) string {
 	return liveKitRoomName(roomID)
 }
