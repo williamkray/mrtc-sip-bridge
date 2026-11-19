@@ -26,6 +26,12 @@ var (
 	RTCDecline = event.Type{Type: "org.matrix.msc4310.rtc.decline", Class: event.MessageEventType}
 	// RTCDeclineAlias is the stable-name alias of RTCDecline.
 	RTCDeclineAlias = event.Type{Type: "m.rtc.decline", Class: event.MessageEventType}
+	// RTCSlot is the slot state event (MSC4143; state key = slot id, SlotIDRoom for the room call).
+	// Never sent or read by us, but clients that start a call natively open the slot first, so it gets a
+	// power level override (wire spec §1.6, matrix-js-sdk MatrixRTCSession.ensureRtcSlotOpen).
+	RTCSlot = event.Type{Type: "org.matrix.msc4143.rtc.slot", Class: event.StateEventType}
+	// RTCSlotAlias is the stable-name alias of RTCSlot; power level override only.
+	RTCSlotAlias = event.Type{Type: "m.rtc.slot", Class: event.StateEventType}
 )
 
 // IngestEventTypes are the types hosts must route into core.Ingest. Order is fixed (tests rely on it).
@@ -36,6 +42,13 @@ func IngestEventTypes() []event.Type {
 // CallMemberPowerLevelTypes must be set to power level 0 in portal rooms so the owner and the ghost
 // can send memberships (wire spec §1.5).
 func CallMemberPowerLevelTypes() []event.Type { return []event.Type{CallMember, CallMemberAlias} }
+
+// CallPowerLevelTypes are all state events set to power level 0 in portal rooms: the call.member types
+// plus the slot types, so the owner can start a call from the client's own call button (wire spec §1.5,
+// §1.6). Order is fixed (tests rely on it).
+func CallPowerLevelTypes() []event.Type {
+	return []event.Type{CallMember, CallMemberAlias, RTCSlot, RTCSlotAlias}
+}
 
 // Well-known key listing MatrixRTC foci (wire §4.1, §8.2). ruma alias "m.rtc_foci" is not read.
 const WellKnownRTCFociKey = "org.matrix.msc4143.rtc_foci"

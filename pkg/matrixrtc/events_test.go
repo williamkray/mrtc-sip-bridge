@@ -120,4 +120,13 @@ func TestIngestEventTypesOrder(t *testing.T) {
 	if len(pl) != 2 || pl[0] != CallMember || pl[1] != CallMemberAlias {
 		t.Fatalf("CallMemberPowerLevelTypes = %v", pl)
 	}
+	all := CallPowerLevelTypes()
+	if len(all) != 4 || all[0] != CallMember || all[1] != CallMemberAlias || all[2] != RTCSlot || all[3] != RTCSlotAlias {
+		t.Fatalf("CallPowerLevelTypes = %v", all)
+	}
+	for _, typ := range all {
+		if !typ.IsState() {
+			t.Errorf("%s is not a state event type", typ.Type)
+		}
+	}
 }

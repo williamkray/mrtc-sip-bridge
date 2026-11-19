@@ -39,11 +39,11 @@ func MarkReadAsOwner(ctx context.Context, ul *bridgev2.UserLogin, roomID id.Room
 	return dp.MarkRead(ctx, roomID, eventID, time.Now())
 }
 
-// callEventTypes are the state events the room owner must be able to send to join a call.
-var callEventTypes = []event.Type{matrixrtc.CallMember, matrixrtc.CallMemberAlias}
+// callEventTypes are the state events the room owner must be able to send to start or join a call.
+var callEventTypes = matrixrtc.CallPowerLevelTypes()
 
-// CallPowerLevelOverrides returns the PL-0 overrides for matrixrtc.CallMember and CallMemberAlias, for
-// bridgev2.ChatMemberList.PowerLevels (a new map on every call).
+// CallPowerLevelOverrides returns the PL-0 overrides for matrixrtc.CallPowerLevelTypes (call.member and
+// rtc.slot, both names), for bridgev2.ChatMemberList.PowerLevels (a new map on every call).
 func CallPowerLevelOverrides() *bridgev2.PowerLevelOverrides {
 	events := make(map[event.Type]int, len(callEventTypes))
 	for _, t := range callEventTypes {
@@ -52,7 +52,7 @@ func CallPowerLevelOverrides() *bridgev2.PowerLevelOverrides {
 	return &bridgev2.PowerLevelOverrides{Events: events}
 }
 
-// WithCallOverrides sets Events[CallMember]=0 and Events[CallMemberAlias]=0 on pl (allocating the map)
+// WithCallOverrides sets every matrixrtc.CallPowerLevelTypes entry to 0 on pl (allocating the map)
 // and reports whether anything changed. Other entries are kept. A nil pl is left alone (false).
 func WithCallOverrides(pl *event.PowerLevelsEventContent) (changed bool) {
 	if pl == nil {

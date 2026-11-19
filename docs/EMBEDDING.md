@@ -36,8 +36,9 @@ so hosts do not copy tested code:
 `Ingest.SetLocalNumber` so span attributes show the SIP account's number rather than anything derived
 from the ref.
 
-Rooms must be able to carry calls: the owner needs power level 0 for `call.member`
-(`hostkit.CallPowerLevelOverrides`, `hostkit.EnsureCallPowerLevels`, `hostkit.WithCallOverrides`), the
+Rooms must be able to carry calls: the owner needs power level 0 for `call.member` and for the MSC4143
+`rtc.slot` that clients open when the call is started from their own call button
+(`matrixrtc.CallPowerLevelTypes`; `hostkit.CallPowerLevelOverrides`, `hostkit.EnsureCallPowerLevels`, `hostkit.WithCallOverrides`), the
 ghost must be joined, and the room should be unencrypted (see 1.6).
 
 ### 1.2 Feed events into the core

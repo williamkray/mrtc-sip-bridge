@@ -120,22 +120,26 @@ func TestCopyKeysNested(t *testing.T) {
 
 func TestWithCallOverrides(t *testing.T) {
 	member, alias := matrixrtc.CallMember.String(), matrixrtc.CallMemberAlias.String()
+	slot, slotAlias := matrixrtc.RTCSlot.String(), matrixrtc.RTCSlotAlias.String()
 	if WithCallOverrides(nil) {
 		t.Fatal("nil content changed")
 	}
 	pl := &event.PowerLevelsEventContent{}
-	if !WithCallOverrides(pl) || pl.Events[member] != 0 || pl.Events[alias] != 0 || len(pl.Events) != 2 {
+	if !WithCallOverrides(pl) || pl.Events[member] != 0 || pl.Events[alias] != 0 || pl.Events[slot] != 0 ||
+		pl.Events[slotAlias] != 0 || len(pl.Events) != 4 {
 		t.Fatalf("nil map: %v", pl.Events)
 	}
 	if WithCallOverrides(pl) {
 		t.Fatal("already set: reported a change")
 	}
-	pl = &event.PowerLevelsEventContent{Events: map[string]int{"m.room.name": 50, member: 50}}
-	if !WithCallOverrides(pl) || pl.Events[member] != 0 || pl.Events[alias] != 0 || pl.Events["m.room.name"] != 50 {
+	pl = &event.PowerLevelsEventContent{Events: map[string]int{"m.room.name": 50, member: 50, slot: 100}}
+	if !WithCallOverrides(pl) || pl.Events[member] != 0 || pl.Events[alias] != 0 || pl.Events[slot] != 0 ||
+		pl.Events[slotAlias] != 0 || pl.Events["m.room.name"] != 50 {
 		t.Fatalf("other events: %v", pl.Events)
 	}
 	ov := CallPowerLevelOverrides()
-	if len(ov.Events) != 2 || ov.Events[matrixrtc.CallMember] != 0 || ov.Events[matrixrtc.CallMemberAlias] != 0 {
+	if len(ov.Events) != 4 || ov.Events[matrixrtc.CallMember] != 0 || ov.Events[matrixrtc.CallMemberAlias] != 0 ||
+		ov.Events[matrixrtc.RTCSlot] != 0 || ov.Events[matrixrtc.RTCSlotAlias] != 0 {
 		t.Fatalf("overrides = %v", ov.Events)
 	}
 	if CallPowerLevelOverrides().Events == nil || &ov.Events == &CallPowerLevelOverrides().Events {

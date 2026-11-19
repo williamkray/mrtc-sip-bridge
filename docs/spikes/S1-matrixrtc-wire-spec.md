@@ -176,6 +176,9 @@ counts as leaving: ruma and js-sdk both treat `created_ts + expires < now` as go
   doesn't exist or isn't open, and the current MSC4075 text requires it. But **no current client
   ringing path uses that function** (Element Web has its own checks, §2.4), and Element Call
   doesn't send slot events. Not needed for S1. Watch for it: a future Element Web may require a slot.
+  Update 2026-11: newer clients open the slot (js-sdk `ensureRtcSlotOpen`) when the user starts a call
+  from the client's call button, so portal rooms set both slot names to power level 0 as well
+  (`matrixrtc.CallPowerLevelTypes`). We still never send or read slot events.
 
 ---
 
